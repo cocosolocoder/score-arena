@@ -50,10 +50,14 @@ type room struct {
 type roomStore struct {
 	mu   sync.Mutex
 	path string
+	// save 持久化全部记录，默认使用 writeAtomic；测试可替换以模拟保存失败。
+	save func(records []json.RawMessage) error
 }
 
 func newRoomStore(path string) *roomStore {
-	return &roomStore{path: path}
+	s := &roomStore{path: path}
+	s.save = s.writeAtomic
+	return s
 }
 
 // load 读取数据文件，返回顶层数组中的原始记录以及已占用的房间编号。
@@ -111,7 +115,7 @@ func (s *roomStore) create(cfg roomConfig) (room, int, error) {
 		return room{}, http.StatusInternalServerError, fmt.Errorf("序列化房间记录失败: %w", err)
 	}
 	records = append(records, encoded)
-	if err := s.writeAtomic(records); err != nil {
+	if err := s.save(records); err != nil {
 		return room{}, http.StatusInternalServerError, err
 	}
 	return newRoom, http.StatusCreated, nil
@@ -210,6 +214,48 @@ func methodNotAllowed(w http.ResponseWriter, allow string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
 }
 
+// newHandler 构建全部路由；run 与测试共用同一份行为。
+func newHandler(store *roomStore) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			respond(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, "GET")
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(indexPage)
+	})
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, "GET")
+			return
+		}
+		respond(w, http.StatusOK, map[string]string{"status": "ok", "product": product})
+	})
+	mux.HandleFunc("/api/rooms", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			store.mu.Lock()
+			records, _, err := store.load()
+			store.mu.Unlock()
+			if err != nil {
+				respond(w, http.StatusInternalServerError, map[string]string{"error": "无法读取房间数据：" + err.Error()})
+				return
+			}
+			respond(w, http.StatusOK, map[string]any{resourceName: records})
+		case http.MethodPost:
+			handleCreateRoom(w, r, store)
+		default:
+			methodNotAllowed(w, "GET, POST")
+		}
+	})
+	return mux
+}
+
 func run() error {
 	if len(os.Args) < 2 {
 		printHelp()
@@ -259,43 +305,7 @@ func run() error {
 		return err
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			respond(w, http.StatusNotFound, map[string]string{"error": "not found"})
-			return
-		}
-		if r.Method != http.MethodGet {
-			methodNotAllowed(w, "GET")
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(indexPage)
-	})
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			methodNotAllowed(w, "GET")
-			return
-		}
-		respond(w, http.StatusOK, map[string]string{"status": "ok", "product": product})
-	})
-	mux.HandleFunc("/api/rooms", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			store.mu.Lock()
-			records, _, err := store.load()
-			store.mu.Unlock()
-			if err != nil {
-				respond(w, http.StatusInternalServerError, map[string]string{"error": "无法读取房间数据：" + err.Error()})
-				return
-			}
-			respond(w, http.StatusOK, map[string]any{resourceName: records})
-		case http.MethodPost:
-			handleCreateRoom(w, r, store)
-		default:
-			methodNotAllowed(w, "GET, POST")
-		}
-	})
+	mux := newHandler(store)
 
 	server := &http.Server{
 		Handler:           mux,
