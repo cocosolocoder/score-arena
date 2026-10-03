@@ -40,7 +40,7 @@
   <form id="room-form" novalidate>
     <div class="field">
       <label for="name">房间名称</label>
-      <input id="name" name="name" type="text" maxlength="80" autocomplete="off"
+      <input id="name" name="name" type="text" autocomplete="off"
              placeholder="1–40 个字符，首尾空白会被去掉" required>
       <p class="hint">名称会去掉首尾空白后保存，内部空格保留；长度按 Unicode 字符计。</p>
     </div>
@@ -138,10 +138,21 @@
     formMsg.textContent = '';
   }
 
+  // 与服务端 strings.TrimSpace 一致的首尾空白范围（Unicode White_Space，
+  // 含普通空格、U+00A0、U+0085 等；U+FEFF 不在其中，应保留并计入长度）。
+  // 注意不能用 String.prototype.trim()：它会多去掉 U+FEFF、又漏掉 U+0085。
+  var EDGE_WS = '[\\t\\n\\x0B\\f\\r \\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]';
+  var LEADING_WS = new RegExp('^' + EDGE_WS + '+');
+  var TRAILING_WS = new RegExp(EDGE_WS + '+$');
+  function trimName(s) {
+    return s.replace(LEADING_WS, '').replace(TRAILING_WS, '');
+  }
+
   // 与服务端一致的提交前校验；服务端仍会再次校验。
+  // 长度按 Unicode 码点计（Array.from 按码点迭代，补充平面字符算 1 个）。
   function validate(payload) {
-    var nameLen = Array.from(payload.name.trim()).length;
-    if (nameLen === 0) return '请填写房间名称。';
+    var nameLen = Array.from(trimName(payload.name)).length;
+    if (nameLen === 0) return '房间名称不能为空。';
     if (nameLen > 40) return '房间名称去掉首尾空白后不能超过 40 个字符。';
     if (payload.game !== 'gomoku' && payload.game !== 'ludo') return '请选择游戏规则。';
     if (payload.game === 'gomoku' && payload.capacity !== 2) return '五子棋的人数上限固定为 2 人。';
@@ -169,8 +180,8 @@
       turnSeconds: turnRaw === '' ? null : Number(turnRaw)
     };
 
-    // 漏填要明确报错，绝不补默认值。
-    if (payload.name.trim() === '') return showMessage('error', '请填写房间名称。'), false;
+    // 漏填要明确报错，绝不补默认值；校验失败保留当前填写内容，不发送请求。
+    if (trimName(payload.name) === '') return showMessage('error', '房间名称不能为空。'), false;
     if (!payload.game) return showMessage('error', '请选择游戏规则。'), false;
     if (payload.capacity === null) return showMessage('error', '请选择人数上限。'), false;
     if (turnRaw === '') return showMessage('error', '请填写每步时间限制（0 表示不限时）。'), false;
