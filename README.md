@@ -36,6 +36,23 @@ go run . serve --host 127.0.0.1 --port 8080 --data-dir data
 
 房间数据保存在 `--data-dir` 下的 `rooms.json`（顶层数组），已有的房间记录及其附带字段会原样保留。
 
+## 回归测试
+
+接口与本地保存的回归测试（Go，启动真实服务子进程）：
+
+```sh
+go test ./...
+```
+
+首页创建公开房间的界面回归测试（Node.js + 系统 Chrome，真实浏览器加载真实服务页面，覆盖成功提示、表单复位、列表刷新、创建被拒与列表刷新失败等页面行为）：
+
+```sh
+npm install
+npm test
+```
+
+需要本机安装 Chrome/Chromium，默认使用 `/usr/bin/google-chrome`，可用 `CHROME_PATH=/path/to/chrome npm test` 覆盖。
+
 ```sh
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/api/rooms
