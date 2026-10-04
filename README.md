@@ -51,6 +51,11 @@ npm install
 npm test
 ```
 
+`npm test` 会同时运行两个浏览器回归文件：
+
+- `ui.test.mjs`：创建成功/被拒、成功后列表竞态刷新、名称整理与长度边界。
+- `ui-capacity-linkage.test.mjs`：游戏规则与人数上限的联动——未选规则禁用人数、五子棋自动固定 2 人、飞行棋 2/3/4、来回切换以当前选择为准（含 4→2→切回仍为 2）、切换时名称/时间保留、切回空规则后旧人数失效、缺规则/缺人数的页面拦截（不发请求、不增房间、内容保留），以及请求体、创建结果与房间列表三处规则/人数的端到端一致性（飞行棋 3 人与 4 人分别验证）。
+
 需要本机安装 Chrome/Chromium，默认使用 `/usr/bin/google-chrome`，可用 `CHROME_PATH=/path/to/chrome npm test` 覆盖。
 
 ```sh
