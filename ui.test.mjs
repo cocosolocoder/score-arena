@@ -186,6 +186,64 @@ async function fillGomokuForm(page, rawName, turnSeconds) {
   await page.type('#turnSeconds', String(turnSeconds));
 }
 
+// 通过页面脚本设置名称输入框的值并触发 input 事件：
+// U+0085、U+00A0、U+FEFF 与补充平面表情等字符无法可靠地逐键输入，
+// 页面提交时读取的正是输入框当前值，与真实用户粘贴输入的效果一致。
+async function setNameValue(page, value) {
+  await page.evaluate((v) => {
+    const el = document.getElementById('name');
+    el.value = v;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }, value);
+}
+
+// 与 fillGomokuForm 相同，但名称可含任意 Unicode 字符。
+async function fillGomokuFormRaw(page, rawName, turnSeconds) {
+  await setNameValue(page, rawName);
+  await page.select('#game', 'gomoku');
+  await page.waitForFunction(
+    () => !document.getElementById('capacity').disabled &&
+      document.getElementById('capacity').value === '2',
+    { timeout: 5000 },
+  );
+  await page.type('#turnSeconds', String(turnSeconds));
+}
+
+// 监听创建请求，返回收集到的请求体数组：用于断言是否发出了创建请求
+// （区分页面直接拦截与请求发出后被服务端拒绝）以及提交的内容是否为用户原始输入。
+function watchPostBodies(page) {
+  const bodies = [];
+  page.on('request', (req) => {
+    if (req.method() === 'POST' && req.url().endsWith('/api/rooms')) {
+      bodies.push(req.postData());
+    }
+  });
+  return bodies;
+}
+
+// 在提交前调用，返回本次创建响应（创建结果）的 Promise。
+function waitForCreated(page) {
+  return new Promise((resolve, reject) => {
+    page.on('response', (resp) => {
+      if (resp.request().method() === 'POST' && resp.url().endsWith('/api/rooms')) {
+        resp.json().then(resolve, reject);
+      }
+    });
+  });
+}
+
+// 断言表单恢复到初始填写状态（创建成功后的复位）。
+async function assertFormReset(page) {
+  assert.deepEqual(await readFormState(page), {
+    name: '',
+    game: '',
+    capacity: '',
+    capacityDisabled: true,
+    turnSeconds: '',
+    submitDisabled: false,
+  }, '创建成功后表单应恢复初始填写状态');
+}
+
 // 完整成功路径：提示展示新编号、表单复位、列表在原有房间之后追加新记录，
 // 且页面上的编号与配置必须来自本次创建结果，而不是仅仅多了一行。
 test('创建成功：显示新编号、表单复位、列表在原有房间后追加与创建结果一致的新记录', { timeout: 60000 }, async (t) => {
@@ -445,4 +503,242 @@ test('提交等待期间创建按钮不可用，请求完成后恢复', { timeou
     { timeout: 10000 },
   );
   assert.equal((await readFormState(page)).submitDisabled, false, '完成后按钮应恢复可用');
+});
+
+// 名称整理（成功路径）：首尾的普通空格、U+0085、U+00A0 被去掉；U+FEFF 不属于
+// 应去掉的空白，位于两端也必须保留并计入长度；内部空白原样保留。
+// 页面提交用户原始输入（不在页面侧裁剪），创建结果与列表展示服务端整理后的名称。
+test('名称整理：首尾 Unicode 空白去掉、U+FEFF 与内部空白保留，提交原始输入、展示整理后名称', { timeout: 60000 }, async (t) => {
+  const { page } = await setupPage(t);
+  const postBodies = watchPostBodies(page);
+  const createdPromise = waitForCreated(page);
+
+  const initialRows = await readRows(page);
+  assertSeedRows(initialRows);
+
+  // 首尾：U+0085、U+00A0、普通空格应被去掉；U+FEFF 保留。内部：U+FEFF 与空格保留。
+  const rawName = '\u0085\u00A0\uFEFF深夜\uFEFF 对局\uFEFF \u00A0\u0085';
+  const trimmedName = '\uFEFF深夜\uFEFF 对局\uFEFF';
+  await fillGomokuFormRaw(page, rawName, 0);
+  await page.click('#submit');
+
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+
+  // 页面提交的是用户原始输入，未在页面侧裁剪或改写。
+  assert.equal(postBodies.length, 1, '应只发出一次创建请求');
+  assert.equal(JSON.parse(postBodies[0]).name, rawName, '提交的名称应保留用户原始输入');
+
+  // 创建结果：服务端整理后的名称（首尾空白去掉，U+FEFF 与内部空白保留）。
+  assert.equal(created.name, trimmedName, '整理后的名称应保留 U+FEFF 与内部空白');
+
+  // 成功提示展示本次编号，表单复位。
+  const msg = await readMessage(page);
+  assert.ok(msg.text.startsWith(SUCCESS_PREFIX), `应显示成功提示，实际: ${msg.text}`);
+  assert.equal(msg.text.slice(SUCCESS_PREFIX.length), created.id);
+  await assertFormReset(page);
+
+  // 列表：原有房间内容与次序不变，新房间追加在后，
+  // 名称完整保留不应删除的字符（U+FEFF）与内部空白，与创建结果一致。
+  await waitForRowCount(page, 3);
+  const rows = await readRows(page);
+  assert.deepEqual(rows.slice(0, 2), initialRows, '原有房间的内容或次序被改变');
+  const added = rows[2];
+  assert.equal(added.cells[0], created.id);
+  assert.equal(added.cells[1], trimmedName, '新行名称应去掉首尾空白、保留 U+FEFF 与内部空白');
+  assert.equal(added.cells[1], created.name, '新行名称应与创建结果一致');
+  assert.equal(added.timeTitle, created.createdAt);
+});
+
+// 只含一个 U+FEFF 的名称仍是合法的一字符名称：不能因为没有可见文字就判空。
+test('名称整理：仅含一个 U+FEFF 的名称是合法的一字符名称，不被判空', { timeout: 60000 }, async (t) => {
+  const { page } = await setupPage(t);
+  const postBodies = watchPostBodies(page);
+  const createdPromise = waitForCreated(page);
+
+  const initialRows = await readRows(page);
+  assertSeedRows(initialRows);
+
+  await fillGomokuFormRaw(page, '\uFEFF', 0);
+  await page.click('#submit');
+
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+
+  assert.equal(postBodies.length, 1, '合法名称不应被页面拦截');
+  assert.equal(created.name, '\uFEFF', 'U+FEFF 应保留并计入长度');
+
+  const msg = await readMessage(page);
+  assert.ok(msg.text.startsWith(SUCCESS_PREFIX), `应显示成功提示，实际: ${msg.text}`);
+  await assertFormReset(page);
+
+  await waitForRowCount(page, 3);
+  const rows = await readRows(page);
+  assert.deepEqual(rows.slice(0, 2), initialRows, '原有房间的内容或次序被改变');
+  assert.equal(rows[2].cells[1], '\uFEFF', '列表应展示保留的 U+FEFF 名称');
+});
+
+// 长度按 Unicode 码点计：中文与补充平面表情各算一个。整理后恰好 40 个码点可创建；
+// 原始输入因首尾空白超过 40 个码点时不得提前拦截（整理后不超即可）。
+test('名称长度：整理后恰好 40 码点（含补充平面表情）可创建，首尾空白导致的超长原始输入不提前拦截', { timeout: 60000 }, async (t) => {
+  const { page } = await setupPage(t);
+  const postBodies = watchPostBodies(page);
+  const createdPromise = waitForCreated(page);
+
+  const initialRows = await readRows(page);
+  assertSeedRows(initialRows);
+
+  // 39 个中文 + 1 个补充平面表情 = 40 个码点（JS 字符串长度为 41，
+  // 若按 UTF-16 长度或字节数判断会被误判为超长）。
+  const name40 = '棋'.repeat(39) + '😀';
+  assert.equal([...name40].length, 40, '前置检查：名称应为 40 个码点');
+  assert.equal(name40.length, 41, '前置检查：UTF-16 长度应为 41，与码点数不同');
+
+  // 首尾空白使原始输入达 44 个码点，页面不得提前拦截。
+  const rawName = '  ' + name40 + ' \u00A0 ';
+  assert.ok([...rawName].length > 40, '前置检查：原始输入应超过 40 个码点');
+
+  await fillGomokuFormRaw(page, rawName, 0);
+  await page.click('#submit');
+
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+
+  // 请求正常发出且提交原始输入；服务端整理后恰好 40 码点，予以创建。
+  assert.equal(postBodies.length, 1, '整理后未超长的名称不应被页面拦截');
+  assert.equal(JSON.parse(postBodies[0]).name, rawName, '提交的名称应保留用户原始输入');
+  assert.equal(created.name, name40, '整理后名称应完整保留表情与中文');
+
+  const msg = await readMessage(page);
+  assert.ok(msg.text.startsWith(SUCCESS_PREFIX), `应显示成功提示，实际: ${msg.text}`);
+  await assertFormReset(page);
+
+  await waitForRowCount(page, 3);
+  const rows = await readRows(page);
+  assert.deepEqual(rows.slice(0, 2), initialRows, '原有房间的内容或次序被改变');
+  assert.equal(rows[2].cells[1], name40, '新行名称应完整保留补充平面表情');
+});
+
+// 整理后为空的名称：页面直接拦截（不发送创建请求），明确提示名称不能为空，
+// 不显示成功编号、不新增记录；已填内容保留，修正名称后按同一规则正常创建。
+test('整理后为空的名称被页面拦截：提示不能为空、不发送请求、保留已填内容，修正后可创建', { timeout: 60000 }, async (t) => {
+  const { page, baseURL } = await setupPage(t);
+  const postBodies = watchPostBodies(page);
+
+  const initialRows = await readRows(page);
+  assertSeedRows(initialRows);
+
+  // 只含会被去掉的首尾空白（普通空格、U+00A0、U+0085），整理后为空。
+  const rawName = '  \u00A0 \u0085  ';
+  await setNameValue(page, rawName);
+  await page.select('#game', 'ludo');
+  await page.select('#capacity', '3');
+  await page.type('#turnSeconds', '60');
+  await page.click('#submit');
+
+  // 页面明确提示名称不能为空，不显示成功编号。
+  await waitForMessageKind(page, 'error');
+  const msg = await readMessage(page);
+  assert.equal(msg.text, '房间名称不能为空。');
+  assert.ok(!msg.text.includes('已创建'), '被拦截时不应出现成功文案');
+
+  // 页面直接拦截：没有发出任何创建请求（区别于请求发出后被服务端拒绝）。
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(postBodies.length, 0, '页面拦截时不应发出创建请求');
+
+  // 名称与其他已填配置保留，用户可直接修正。
+  assert.deepEqual(await readFormState(page), {
+    name: rawName,
+    game: 'ludo',
+    capacity: '3',
+    capacityDisabled: false,
+    turnSeconds: '60',
+    submitDisabled: false,
+  }, '被拦截后应保留已填写内容并恢复按钮可用');
+
+  // 页面列表与服务端都没有新增记录。
+  assert.deepEqual(await readRows(page), initialRows, '被拦截时不应改动房间列表');
+  const res = await fetch(baseURL + '/api/rooms');
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).rooms.length, 2, '服务端不应新增房间记录');
+
+  // 只修正名称（其余配置保留）即可再次提交，按同一规则正常创建。
+  const fixedName = '改好的 飞行棋 房间';
+  await setNameValue(page, fixedName);
+  await page.click('#submit');
+
+  await waitForMessageKind(page, 'ok');
+  assert.equal(postBodies.length, 1, '修正后应正常发出创建请求');
+  const msg2 = await readMessage(page);
+  assert.ok(msg2.text.startsWith(SUCCESS_PREFIX), `修正后应创建成功，实际: ${msg2.text}`);
+
+  await waitForRowCount(page, 3);
+  const rows = await readRows(page);
+  assert.deepEqual(rows.slice(0, 2), initialRows, '原有房间的内容或次序被改变');
+  const added = rows[2];
+  assert.equal(added.cells[1], fixedName, '修正后的名称应生效并保留内部空格');
+  assert.equal(added.cells[2], '飞行棋', '应沿用保留的游戏规则');
+  assert.equal(added.cells[3], '3 人', '应沿用保留的人数上限');
+  assert.equal(added.cells[4], '60 秒', '应沿用保留的时间限制');
+});
+
+// 整理后仍超过 40 个码点的名称：页面直接拦截（不发送创建请求），明确提示超过
+// 长度上限，不显示成功编号、不新增记录；已填内容保留，修正后正常创建。
+test('整理后超过 40 码点的名称被页面拦截：提示超长、不发送请求、不新增记录，修正后可创建', { timeout: 60000 }, async (t) => {
+  const { page, baseURL } = await setupPage(t);
+  const postBodies = watchPostBodies(page);
+  const createdPromise = waitForCreated(page);
+
+  const initialRows = await readRows(page);
+  assertSeedRows(initialRows);
+
+  // 40 个中文 + 1 个补充平面表情 = 41 个码点，整理后仍超长。
+  const name41 = '棋'.repeat(40) + '😀';
+  assert.equal([...name41].length, 41, '前置检查：名称应为 41 个码点');
+
+  await fillGomokuFormRaw(page, name41, 0);
+  await page.click('#submit');
+
+  // 页面明确提示超过长度上限，不显示成功编号。
+  await waitForMessageKind(page, 'error');
+  const msg = await readMessage(page);
+  assert.equal(msg.text, '房间名称去掉首尾空白后不能超过 40 个字符。');
+  assert.ok(!msg.text.includes('已创建'), '被拦截时不应出现成功文案');
+
+  // 页面直接拦截：没有发出任何创建请求（区别于请求发出后被服务端拒绝）。
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(postBodies.length, 0, '页面拦截时不应发出创建请求');
+
+  // 已填内容保留，用户可直接修正。
+  assert.deepEqual(await readFormState(page), {
+    name: name41,
+    game: 'gomoku',
+    capacity: '2',
+    capacityDisabled: false,
+    turnSeconds: '0',
+    submitDisabled: false,
+  }, '被拦截后应保留已填写内容并恢复按钮可用');
+
+  // 页面列表与服务端都没有新增记录。
+  assert.deepEqual(await readRows(page), initialRows, '被拦截时不应改动房间列表');
+  const res = await fetch(baseURL + '/api/rooms');
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).rooms.length, 2, '服务端不应新增房间记录');
+
+  // 修正为整理后恰好 40 码点的名称（首尾空白不提前拦截），即可正常创建。
+  const fixedTrimmed = '棋'.repeat(39) + '😀';
+  const fixedRaw = '  ' + fixedTrimmed + '  ';
+  await setNameValue(page, fixedRaw);
+  await page.click('#submit');
+
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+  assert.equal(postBodies.length, 1, '修正后应正常发出创建请求');
+  assert.equal(JSON.parse(postBodies[0]).name, fixedRaw, '提交的名称应保留用户原始输入');
+  assert.equal(created.name, fixedTrimmed, '整理后恰好 40 码点应创建成功');
+
+  await waitForRowCount(page, 3);
+  const rows = await readRows(page);
+  assert.deepEqual(rows.slice(0, 2), initialRows, '原有房间的内容或次序被改变');
+  assert.equal(rows[2].cells[1], fixedTrimmed, '修正后的名称应完整保留表情');
 });
