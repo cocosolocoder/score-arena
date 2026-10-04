@@ -8,6 +8,13 @@
 // 两者不能混为一谈：创建被拒时列表不得新增记录；创建成功但列表刷新失败时，
 // 成功提示与编号必须保留，列表区域必须显示加载失败而非“还没有房间记录”。
 //
+// 列表查询交错（“只允许最新一次查询更新列表”）另有一组用例：打开首页会读取一次
+// 列表（查询①），创建成功后再读取一次（查询②）；若①尚未返回，两次查询会同时在途。
+// 页面用递增序号保证只有最新发起的查询（②）可以更新列表，较早查询（①）迟到的结果
+// （旧列表、空列表或读取失败）一律忽略。这组用例精确控制两次 GET 的返回时机与内容，
+// 分别覆盖②先返回而①迟到（成功/空/失败）、②失败而①后到、①在②在途时先完成却不得
+// 抢先更新，以及没有交错时的基线展示。
+//
 // 名称处理另有一组用例：页面提交前按与服务端一致的规则整理名称
 // （去掉首尾 Unicode 空白、保留 U+FEFF、长度按码点计），这些用例必须区分
 // “页面直接拦截（不发出创建请求）”与“请求发出后被服务端拒绝”，防止页面
@@ -706,4 +713,361 @@ test('超过 40 码点的名称被页面拦截：不发请求、保留已填内�
   const rows = await readRows(page);
   assert.deepEqual(rows.slice(0, 2), initialRows, '原有房间的内容或次序被改变');
   assert.equal(rows[2].cells[1], name40);
+});
+
+// ---------------------------------------------------------------------------
+// 列表查询交错返回（listQuerySeq）回归测试
+//
+// 打开首页时页面读取一次房间列表（查询①）；创建房间成功后再读取一次（查询②）。
+// 若①迟迟不返回，两次查询会同时在途。页面约定：只有最新发起的查询（②）允许更新
+// 列表区域，较早查询（①）无论后到的是成功（旧列表/空列表）还是失败，都必须忽略。
+//
+// 下面的用例用请求拦截把两次列表 GET 都挂起，再按用例需要精确控制各自的返回时机与
+// 内容：列表 GET 捕获后挂起（由测试显式放行），创建 POST 与其他请求一律放行到真实
+// 服务，保证创建真实落库；需要“本次查询成功”时对挂起的 GET 调用 continue() 走真实
+// 服务（能读到创建后的最新数据），需要模拟特定快照/失败时用 respond() 合成响应。
+// ---------------------------------------------------------------------------
+
+const SEED_OBJECTS = [JSON.parse(SEED_ALPHA), JSON.parse(SEED_BETA)];
+
+// 列表查询成功/失败的合成响应。
+function listOK(rooms) {
+  return {
+    status: 200,
+    contentType: 'application/json; charset=utf-8',
+    body: JSON.stringify({ rooms }),
+  };
+}
+const LIST_FAIL_RESPONSE = {
+  status: 500,
+  contentType: 'application/json; charset=utf-8',
+  body: JSON.stringify({ error: '模拟列表读取失败' }),
+};
+const LIST_ERROR_TEXT = '房间列表加载失败，请稍后刷新重试。已有数据不会因此丢失。';
+const EMPTY_TEXT = '还没有房间记录。';
+
+// setupHeldPage 启动独立服务并打开首页，但在页面脚本发出列表查询之前开启拦截：
+// 所有 GET /api/rooms 被捕获后挂起（推入 gets，等待测试放行），POST 与其他请求放行到
+// 真实服务。seedRaw 为创建前数据文件中的房间记录（原始 JSON 字符串数组），传 [] 表示
+// 原本没有房间。返回首次查询的请求对象 req1 与全部被挂起的 GET 列表。
+async function setupHeldPage(t, seedRaw = [SEED_ALPHA, SEED_BETA]) {
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'score-arena-uiheld-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  await writeFile(
+    path.join(dataDir, 'rooms.json'),
+    seedRaw.length ? '[\n' + seedRaw.join(',\n') + '\n]\n' : '[]\n',
+  );
+  const baseURL = await startServer(t, dataDir);
+  const page = await browser.newPage();
+  t.after(() => page.close());
+
+  const gets = [];
+  await page.setRequestInterception(true);
+  page.on('request', (req) => {
+    if (req.method() === 'GET' && req.url().endsWith('/api/rooms')) {
+      gets.push(req); // 挂起：等待测试决定何时、以何种结果放行。
+      return;
+    }
+    req.continue().catch(() => {});
+  });
+
+  await page.goto(baseURL, { waitUntil: 'load' });
+  const req1 = await waitForHeldGet(gets, 0);
+  return { page, baseURL, gets, req1 };
+}
+
+// waitForHeldGet 等待第 index 次列表查询被页面发出并被拦截挂起。
+async function waitForHeldGet(gets, index) {
+  for (let i = 0; i < 1000; i++) {
+    if (gets[index]) return gets[index];
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`等待第 ${index + 1} 次列表查询发出超时`);
+}
+
+// settle 等待一小段时间，让被放行查询的响应穿过页面的 then/catch 处理，
+// 以便断言“迟到结果已被接收但按序号规则忽略”，而不是尚未返回。
+function settle() {
+  return new Promise((resolve) => setTimeout(resolve, 300));
+}
+
+// 表单成功提交后断言成功提示含本次编号、表单恢复初始状态、按钮恢复可用。
+async function assertSuccessUI(page, created) {
+  const msg = await readMessage(page);
+  assert.ok(msg.className.includes('ok'), `应显示创建成功提示，实际 class: ${msg.className}`);
+  assert.equal(msg.text, SUCCESS_PREFIX + created.id, '成功提示中的编号应与创建结果一致');
+  assert.deepEqual(await readFormState(page), {
+    name: '',
+    game: '',
+    capacity: '',
+    capacityDisabled: true,
+    turnSeconds: '',
+    submitDisabled: false,
+  }, '创建成功后表单应恢复初始填写状态，按钮恢复可用');
+}
+
+// 断言列表当前既没有房间表格，也没有加载失败提示（即没有任何查询结果抢先上屏）。
+// 注意：两次查询都在途时，列表区域仍保留静态的初始空提示，因此这里只校验
+// “没有表格 / 没有失败提示”，不校验空提示（那是加载前的既有初始状态）。
+async function assertListUntouched(page, note) {
+  const list = await readListArea(page);
+  assert.equal(list.hasTable, false, `${note}：较早查询不得抢先用旧结果填充房间表格`);
+  assert.equal(list.errorText, null, `${note}：较早查询不得抢先显示它的加载失败提示`);
+}
+
+// 创建成功 → 查询②先成功返回（创建后快照）→ 查询①迟到旧列表（有原有房间）。
+// 页面应展示②包含的原有房间与新房间、保持次序；①的旧列表随后必须被忽略。
+test('交错：创建后的查询先返回含新房间的列表，较早查询迟到的旧列表被忽略', { timeout: 60000 }, async (t) => {
+  const { page, gets, req1 } = await setupHeldPage(t);
+
+  const createdPromise = nextCreated(page);
+  await fillGomokuForm(page, '  交错 五子棋 房间 ', 0);
+  await page.click('#submit');
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+
+  // 创建成功后页面发出查询②；两次查询此时同时在途。
+  const req2 = await waitForHeldGet(gets, 1);
+
+  // 查询②先放行到真实服务：此时创建已落库，返回“原有 2 间 + 新房间”。
+  await req2.continue();
+  await waitForRowCount(page, 3);
+  const rowsAfterSecond = await readRows(page);
+
+  // 原有房间内容与次序不变，新房间各列与创建结果逐项一致。
+  assert.deepEqual(
+    rowsAfterSecond.map((r) => r.cells.slice(0, 6)),
+    [
+      ['seed-alpha', '晨间飞行棋', '飞行棋', '4 人', '30 秒', 'playing'],
+      ['seed-beta', '午夜五子棋', '五子棋', '2 人', '不限时', '未开始'],
+      [created.id, '交错 五子棋 房间', '五子棋', '2 人', '不限时', '未开始'],
+    ],
+    '查询②返回后应按其次序展示原有房间与新房间',
+  );
+  assert.equal(rowsAfterSecond[2].badge, '未开始');
+  assert.equal(rowsAfterSecond[2].timeTitle, created.createdAt, '新房间创建时间应与创建结果一致');
+
+  await assertSuccessUI(page, created);
+
+  // 查询①随后才返回：它读到的是创建前的旧列表（只有 2 间）。
+  await req1.respond(listOK(SEED_OBJECTS));
+  await settle();
+
+  // 旧列表必须被忽略：仍是查询②展示的 3 行，新房间不消失。
+  const rowsAfterLateFirst = await readRows(page);
+  assert.deepEqual(rowsAfterLateFirst, rowsAfterSecond, '较早查询的旧列表不得覆盖已展示的新列表');
+  const list = await readListArea(page);
+  assert.ok(list.hasTable, '应继续展示新列表表格');
+  assert.equal(list.errorText, null);
+  assert.equal(list.emptyText, null, '不得因较早查询的旧结果重新出现空列表提示');
+  assert.ok(
+    rowsAfterLateFirst.some((r) => r.cells[0] === created.id),
+    '新房间不得因较早查询的迟到结果消失',
+  );
+});
+
+// 创建成功 → 查询②先成功（创建后只有新房间）→ 查询①迟到空列表（创建前没有房间）。
+// 空列表同样是“较早查询的旧结果”，必须忽略，不能让新房间消失或重现空提示。
+test('交错：原本无房间，较早查询迟到返回空列表也不能让新房间消失或重现空提示', { timeout: 60000 }, async (t) => {
+  const { page, gets, req1 } = await setupHeldPage(t, []);
+
+  const createdPromise = nextCreated(page);
+  await page.type('#name', ' 空房后 新建 飞行棋 ');
+  await page.select('#game', 'ludo');
+  await page.waitForFunction(() => !document.getElementById('capacity').disabled, { timeout: 5000 });
+  await page.select('#capacity', '3');
+  await page.type('#turnSeconds', '60');
+  await page.click('#submit');
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+
+  const req2 = await waitForHeldGet(gets, 1);
+  await req2.continue(); // 查询②走真实服务，返回创建后的唯一房间。
+  await waitForRowCount(page, 1);
+  const rowsAfterSecond = await readRows(page);
+  assert.deepEqual(
+    rowsAfterSecond.map((r) => r.cells.slice(0, 6)),
+    [[created.id, '空房后 新建 飞行棋', '飞行棋', '3 人', '60 秒', '未开始']],
+    '查询②应展示新房间，编号与配置与创建结果一致',
+  );
+  assert.equal(rowsAfterSecond[0].badge, '未开始');
+  assert.equal(rowsAfterSecond[0].timeTitle, created.createdAt);
+  await assertSuccessUI(page, created);
+
+  // 查询①迟到返回创建前的空列表。
+  await req1.respond(listOK([]));
+  await settle();
+
+  const rowsAfterLateFirst = await readRows(page);
+  assert.deepEqual(rowsAfterLateFirst, rowsAfterSecond, '较早查询的空列表不得覆盖已展示的新房间');
+  const list = await readListArea(page);
+  assert.equal(list.emptyText, null, '不得因较早查询的空结果重新出现“还没有房间记录”');
+  assert.ok(!list.text.includes(EMPTY_TEXT), '列表区域不得出现空列表文案');
+  assert.ok(list.hasTable, '应继续展示新房间表格');
+  assert.equal(rowsAfterLateFirst[0].cells[0], created.id, '新房间不得消失');
+});
+
+// 创建成功 → 查询②先成功 → 查询①最后读取失败。已显示的新列表必须保留，
+// 较早查询的失败不得把列表区域换成加载失败提示。
+test('交错：较早查询最后读取失败，已显示的新列表保留不被失败提示替换', { timeout: 60000 }, async (t) => {
+  const { page, gets, req1 } = await setupHeldPage(t);
+
+  const createdPromise = nextCreated(page);
+  await fillGomokuForm(page, '迟到失败也忽略', 120);
+  await page.click('#submit');
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+
+  const req2 = await waitForHeldGet(gets, 1);
+  await req2.continue();
+  await waitForRowCount(page, 3);
+  const rowsAfterSecond = await readRows(page);
+  assert.equal(rowsAfterSecond[2].cells[0], created.id);
+
+  // 查询①最后以读取失败返回。
+  await req1.respond(LIST_FAIL_RESPONSE);
+  await settle();
+
+  assert.deepEqual(await readRows(page), rowsAfterSecond, '较早查询失败不得改动已展示的新列表');
+  const list = await readListArea(page);
+  assert.equal(list.errorText, null, '较早查询的失败不得显示为加载失败提示');
+  assert.ok(list.hasTable, '应继续展示新列表表格');
+  assert.ok(!list.text.includes(LIST_ERROR_TEXT), '列表区域不得出现加载失败文案');
+});
+
+// 创建成功 → 查询②（本次刷新）读取失败 → 查询①随后成功返回创建前的旧房间。
+// 列表必须保留“本次加载失败”，不能拿较早查询的旧记录冒充刷新成功，也不能把失败
+// 解释成没有房间；创建成功与列表失败是两回事：成功提示、编号、表单复位与按钮照常。
+test('交错：创建后的查询失败、较早查询随后成功，保留本次失败提示且不用旧记录冒充', { timeout: 60000 }, async (t) => {
+  const { page, baseURL, gets, req1 } = await setupHeldPage(t);
+
+  const createdPromise = nextCreated(page);
+  await fillGomokuForm(page, '本次刷新失败的房间', 0);
+  await page.click('#submit');
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+
+  // 查询②（最新一次）先返回读取失败。
+  const req2 = await waitForHeldGet(gets, 1);
+  await req2.respond(LIST_FAIL_RESPONSE);
+  await page.waitForFunction(
+    () => !!document.querySelector('#list-area .list-error'),
+    { timeout: 10000 },
+  );
+  let list = await readListArea(page);
+  assert.equal(list.errorText, LIST_ERROR_TEXT, '最新查询失败应显示本次加载失败提示');
+  assert.equal(list.hasTable, false, '加载失败时不应展示房间表格');
+  assert.equal(list.emptyText, null, '不得把读取失败解释成没有房间');
+
+  // 查询①随后成功返回创建前的旧房间（2 间）。
+  await req1.respond(listOK(SEED_OBJECTS));
+  await settle();
+
+  list = await readListArea(page);
+  assert.equal(list.errorText, LIST_ERROR_TEXT, '较早查询成功不得替换本次加载失败提示');
+  assert.equal(list.hasTable, false, '不得拿较早查询的旧房间记录冒充这次刷新成功');
+  assert.equal(list.emptyText, null, '不得转成空列表提示');
+  assert.ok(!list.text.includes('seed-alpha'), '较早查询的旧房间记录不得显示出来');
+
+  // 创建成功与列表读取失败是两个独立结果：成功侧的 UI 一律保留。
+  await assertSuccessUI(page, created);
+
+  // 服务端确实已保存新房间，证明创建本身成功，仅列表刷新失败。
+  const res = await fetch(baseURL + '/api/rooms');
+  assert.equal(res.status, 200);
+  const serverRooms = (await res.json()).rooms;
+  assert.equal(serverRooms.length, 3, '服务端应已保存新房间');
+  assert.equal(serverRooms[2].id, created.id);
+});
+
+// 查询①在查询②已发起但尚未返回时先成功返回（旧列表）：不得抢先更新列表；
+// 之后查询②成功，页面由②的结果决定。
+test('交错：较早查询在较晚查询在途时先成功返回不抢先，之后由较晚查询结果决定', { timeout: 60000 }, async (t) => {
+  const { page, gets, req1 } = await setupHeldPage(t);
+
+  const createdPromise = nextCreated(page);
+  await fillGomokuForm(page, '先后次序之争', 0);
+  await page.click('#submit');
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+
+  // 查询②已发起，两次查询同在途。
+  const req2 = await waitForHeldGet(gets, 1);
+
+  // 查询①先完成并返回创建前的旧列表——此时它已不是最新查询，必须被忽略。
+  await req1.respond(listOK(SEED_OBJECTS));
+  await settle();
+  await assertListUntouched(page, '较早查询成功返回时不得抢先上屏');
+
+  // 查询②随后成功：页面改由②的结果决定（原有 2 间 + 新房间）。
+  await req2.continue();
+  await waitForRowCount(page, 3);
+  assert.deepEqual(
+    (await readRows(page)).map((r) => r.cells.slice(0, 6)),
+    [
+      ['seed-alpha', '晨间飞行棋', '飞行棋', '4 人', '30 秒', 'playing'],
+      ['seed-beta', '午夜五子棋', '五子棋', '2 人', '不限时', '未开始'],
+      [created.id, '先后次序之争', '五子棋', '2 人', '不限时', '未开始'],
+    ],
+    '较晚查询成功后应展示其返回的列表',
+  );
+  const list = await readListArea(page);
+  assert.ok(list.hasTable);
+  assert.equal(list.errorText, null);
+});
+
+// 查询①在查询②在途时先返回失败：不得抢先显示它的失败提示；查询②成功后正常展示。
+test('交错：较早查询在较晚查询在途时先失败不抢先提示，较晚查询成功后正常展示', { timeout: 60000 }, async (t) => {
+  const { page, gets, req1 } = await setupHeldPage(t);
+
+  const createdPromise = nextCreated(page);
+  await fillGomokuForm(page, '较早失败被忽略', 30);
+  await page.click('#submit');
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+
+  const req2 = await waitForHeldGet(gets, 1);
+
+  // 查询①先失败返回，不得抢先显示失败提示。
+  await req1.respond(LIST_FAIL_RESPONSE);
+  await settle();
+  await assertListUntouched(page, '较早查询失败时不得抢先显示失败提示');
+
+  // 查询②成功：展示房间表格，不残留任何失败提示。
+  await req2.continue();
+  await waitForRowCount(page, 3);
+  const rows = await readRows(page);
+  assert.equal(rows[2].cells[0], created.id, '较晚查询成功后应展示新房间');
+  const list = await readListArea(page);
+  assert.equal(list.errorText, null, '较晚查询成功后不得残留较早查询的失败提示');
+  assert.ok(list.hasTable);
+});
+
+// 无交错基线：服务端原本没有房间，首次查询正常返回空列表，显示空列表提示。
+test('无交错基线：原本没有房间时首页显示空列表提示', { timeout: 60000 }, async (t) => {
+  const { page, req1 } = await setupHeldPage(t, []);
+  await req1.continue(); // 只有首次查询，且正常返回。
+  await page.waitForFunction(
+    () => !!document.querySelector('#list-area .empty'),
+    { timeout: 10000 },
+  );
+  const list = await readListArea(page);
+  assert.equal(list.emptyText, EMPTY_TEXT);
+  assert.equal(list.hasTable, false);
+  assert.equal(list.errorText, null);
+});
+
+// 无交错基线：首次查询读取失败时显示加载失败，而不是空列表提示或房间表格。
+test('无交错基线：首次查询读取失败时显示加载失败而非空列表', { timeout: 60000 }, async (t) => {
+  const { page, req1 } = await setupHeldPage(t);
+  await req1.respond(LIST_FAIL_RESPONSE);
+  await page.waitForFunction(
+    () => !!document.querySelector('#list-area .list-error'),
+    { timeout: 10000 },
+  );
+  const list = await readListArea(page);
+  assert.equal(list.errorText, LIST_ERROR_TEXT);
+  assert.equal(list.hasTable, false, '读取失败时不应展示房间表格');
+  assert.equal(list.emptyText, null, '读取失败不得显示为空列表');
+  assert.ok(!list.text.includes(EMPTY_TEXT));
 });
