@@ -114,6 +114,19 @@ function waitForMessageKind(page, kind) {
   );
 }
 
+// waitForAnyMessage 等待表单提示落定为成功或错误其一。拦截类用例用它等待：
+// 若页面意外放行了本该拦截的提交，成功提示会立刻出现，断言随即快速、精准地
+// 失败，而不是干等错误提示直到超时。
+function waitForAnyMessage(page) {
+  return page.waitForFunction(
+    () => {
+      const el = document.getElementById('form-msg');
+      return el.classList.contains('ok') || el.classList.contains('error');
+    },
+    { timeout: 10000 },
+  );
+}
+
 // readRows 读取列表每一行的单元格文本、创建时间单元格的 title（原始 ISO 时间）
 // 以及状态列徽标文本，用于逐格比对内容与次序。
 function readRows(page) {
@@ -1206,4 +1219,517 @@ test('无交错基线：首次读取失败显示加载失败，创建成功后�
   assert.equal(list.errorText, null, '创建后的成功刷新应替换掉之前的失败提示');
   assert.equal(list.emptyText, null);
   assert.ok(list.hasTable);
+});
+
+// =============================================================================
+// 游戏规则与人数上限联动回归
+//
+// 切换游戏规则会重建人数上限选项：未选规则时不可填写；五子棋固定 2 人；
+// 飞行棋允许 2/3/4 人；切回“请选择游戏规则…”后人数重新不可填。这组用例把
+// “切换过程 → 页面当前选择 → 实际提交与保存”串起来断言，专门防止两类回归：
+//   1. 页面显示的是当前规则下的人数，提交保存的却是先前规则下的旧值
+//      （例如飞行棋选 4 人后改五子棋，却仍把 ludo / capacity 4 发出去，
+//      或飞行棋的 3、4 人都被错误保存成 2 人）；
+//   2. 切换时错误地替用户预选或残留人数，或把名称、时间限制一并清掉。
+//
+// 拦截类用例沿用本文件既有分工：页面缺项直接拦截时不发出任何创建请求、
+// 不增加房间，已填内容保留；补齐后按“此时”的规则与人数创建，成功后人数
+// 回到不可填写的初始状态，等待下一次选择规则。
+
+// readCapacityOptions 读取人数下拉的全部选项（值、文案、是否选中），
+// 用于断言某条规则下到底存在哪些可提交人数，以及当前选中的是不是占位项。
+function readCapacityOptions(page) {
+  return page.$$eval('#capacity option', (opts) =>
+    opts.map((o) => ({ value: o.value, text: o.textContent, selected: o.selected })),
+  );
+}
+
+function readCapacityHint(page) {
+  return page.$eval('#capacity-hint', (el) => el.textContent);
+}
+
+// waitForCapacityEnabled 等待人数下拉的禁用状态落定（change 处理器重建选项时
+// 一定会设置它）；具体选中值由随后的断言精确比对，避免回归时只得到等待超时。
+function waitForCapacityEnabled(page, disabled) {
+  return page.waitForFunction(
+    (want) => document.getElementById('capacity').disabled === want,
+    { timeout: 5000 },
+    disabled,
+  );
+}
+
+// waitForGameValue 等待规则下拉落到目标值。切回“请选择…”后人数“本应禁用”，
+// 不能用等待禁用态来同步（禁用逻辑一旦回归就只能等到超时）；规则值在 change
+// 事件同一次派发中设置，等到它即说明联动处理器已执行完，随后直接精确断言。
+function waitForGameValue(page, value) {
+  return page.waitForFunction(
+    (want) => document.getElementById('game').value === want,
+    { timeout: 5000 },
+    value,
+  );
+}
+
+// waitForFormReset 等待创建成功后表单值被清空（form.reset 与随后的联动重建
+// 在同一同步流程内）；人数是否重新禁用由随后的断言精确比对。
+function waitForFormReset(page) {
+  return page.waitForFunction(
+    () => document.getElementById('game').value === '' &&
+      document.getElementById('name').value === '' &&
+      document.getElementById('turnSeconds').value === '',
+    { timeout: 5000 },
+  );
+}
+
+// trackRoomCreates 同时收集每次创建的请求体与创建结果（按发生顺序），
+// 供同一用例内连续多次创建时逐轮对照“提交值 ↔ 创建结果”。
+// 非成功响应（如被服务端拒绝）不计入 rooms，避免失败响应冒充创建结果。
+function trackRoomCreates(page) {
+  const posts = [];
+  const rooms = [];
+  page.on('request', (req) => {
+    if (req.method() === 'POST' && req.url().endsWith('/api/rooms')) {
+      posts.push(req.postData());
+    }
+  });
+  page.on('response', (resp) => {
+    if (resp.request().method() === 'POST' && resp.url().endsWith('/api/rooms') && resp.ok()) {
+      resp.json().then((room) => rooms.push(room), () => {});
+    }
+  });
+  async function waitForCount(count) {
+    const deadline = Date.now() + 10000;
+    while (rooms.length < count) {
+      if (Date.now() > deadline) throw new Error(`等待第 ${count} 个创建结果超时（实际 ${rooms.length} 个）`);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+  }
+  return { posts, rooms, waitForCount };
+}
+
+// waitForPostOrClientError 在点击提交后等待“第 count 个创建请求已发出”或
+// “页面直接弹出错误提示”先发生：联动回归时，页面可能因显示值与规则不一致而
+// 在客户端拦截提交（不发请求），此时直接返回错误文案让断言快速、精准地失败，
+// 而不是干等请求直到超时。正常路径返回 null。
+async function waitForPostOrClientError(page, posts, count) {
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    if (posts.length >= count) return null;
+    const msg = await readMessage(page);
+    if (msg.className.includes('error')) return msg.text;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+  throw new Error(`等待第 ${count} 个创建请求或页面提示超时（实际只发出 ${posts.length} 个请求）`);
+}
+
+// 未选择游戏规则时：人数下拉禁用、值为空，只有“请先选择游戏规则”占位项，
+// 不存在任何可提交的人数。
+test('未选择游戏规则时人数上限不可填写，仅提示先选择游戏规则', { timeout: 60000 }, async (t) => {
+  const { page } = await setupPage(t);
+
+  const form = await readFormState(page);
+  assert.equal(form.game, '');
+  assert.equal(form.capacity, '');
+  assert.equal(form.capacityDisabled, true, '未选规则时人数下拉必须禁用');
+
+  const options = await readCapacityOptions(page);
+  assert.deepEqual(
+    options.map((o) => [o.value, o.text]),
+    [['', '请先选择游戏规则']],
+    '禁用状态下不应存在任何可提交的人数选项',
+  );
+  assert.equal(await readCapacityHint(page), '五子棋人数固定为 2 人；飞行棋允许 2 至 4 人。');
+});
+
+// 规则来回切换的联动状态机：
+// 首次选飞行棋不预选 → 选 3 人后切五子棋必须强制为 2（3/4 选项消失）→
+// 切回飞行棋保留合法的 2 → 改选 4 → 再切五子棋仍是 2 → 再切飞行棋保留 2，
+// 不能恢复最初选过的 4。全程名称与时间限制只填写一次，必须原样保留。
+test('切换规则联动人数：五子棋固定 2 人，来回切换以当前选择为准、不恢复旧值', { timeout: 60000 }, async (t) => {
+  const { page } = await setupPage(t);
+
+  // 名称与时间先填好：后续无论怎么切换规则，这两个输入都必须保留。
+  const name = '规则联动房间';
+  const turn = '60';
+  await page.type('#name', name);
+  await page.type('#turnSeconds', turn);
+  const assertNameTurnKept = async (when) => {
+    const f = await readFormState(page);
+    assert.equal(f.name, name, `${when}后房间名称应保留`);
+    assert.equal(f.turnSeconds, turn, `${when}后时间限制应保留`);
+  };
+
+  // 首次选择飞行棋：2/3/4 选项就绪，但人数保持未选择，不替用户预选。
+  await page.select('#game', 'ludo');
+  await waitForCapacityEnabled(page, false);
+  let options = await readCapacityOptions(page);
+  assert.deepEqual(
+    options.map((o) => [o.value, o.text]),
+    [['', '请选择人数上限…'], ['2', '2 人'], ['3', '3 人'], ['4', '4 人']],
+    '飞行棋应提供 2/3/4 人且以未选择占位项开头',
+  );
+  assert.equal(options.find((o) => o.selected).value, '', '首次选飞行棋不应预选人数');
+  assert.equal(await readCapacityHint(page), '飞行棋人数上限允许 2 至 4 人。');
+
+  // 飞行棋下选 3 人后切五子棋：必须自动改为固定 2 人，不能沿用 3 人。
+  await page.select('#capacity', '3');
+  await page.select('#game', 'gomoku');
+  await waitForCapacityEnabled(page, false);
+  let form = await readFormState(page);
+  assert.equal(form.game, 'gomoku');
+  assert.equal(form.capacity, '2', '切到五子棋后人数必须自动变为 2，不能沿用飞行棋的 3 人');
+  options = await readCapacityOptions(page);
+  assert.deepEqual(
+    options.map((o) => [o.value, o.text]),
+    [['', '固定 2 人'], ['2', '2 人']],
+    '五子棋下不应出现 3/4 人选项',
+  );
+  assert.equal(options.find((o) => o.selected).value, '2');
+  assert.equal(await readCapacityHint(page), '五子棋人数上限固定为 2 人。');
+  await assertNameTurnKept('选择五子棋');
+
+  // 五子棋切到飞行棋：当前合法的 2 人保留。
+  await page.select('#game', 'ludo');
+  await waitForCapacityEnabled(page, false);
+  options = await readCapacityOptions(page);
+  assert.deepEqual(options.map((o) => o.value), ['', '2', '3', '4']);
+  assert.equal(options.find((o) => o.selected).value, '2', '从五子棋切到飞行棋应保留当前合法的 2 人');
+  await assertNameTurnKept('切换到飞行棋');
+
+  // 飞行棋改选 4 人，再改回五子棋：必须又是 2 人。
+  await page.select('#capacity', '4');
+  assert.equal((await readFormState(page)).capacity, '4');
+  await page.select('#game', 'gomoku');
+  await waitForCapacityEnabled(page, false);
+  assert.equal(
+    (await readFormState(page)).capacity,
+    '2',
+    '飞行棋选 4 人后改选五子棋，人数必须是 2',
+  );
+
+  // 随后切回飞行棋：保留的是当前的 2 人，绝不能恢复这轮先前选过的 4 人。
+  await page.select('#game', 'ludo');
+  await waitForCapacityEnabled(page, false);
+  form = await readFormState(page);
+  assert.equal(form.capacity, '2', '五子棋再切回飞行棋应保留 2 人，不能恢复先前的 4 人');
+  assert.deepEqual(
+    (await readCapacityOptions(page)).map((o) => o.value),
+    ['', '2', '3', '4'],
+    '飞行棋的 2/3/4 选项应重新可用',
+  );
+  await assertNameTurnKept('规则来回切换');
+});
+
+// 独立覆盖“从未选规则的状态首次选择飞行棋”：人数保持未选择，2/3/4 均可选
+// 但没有任何一项被默认选中。
+test('从未选规则状态首次选择飞行棋：人数保持未选择，不替用户决定', { timeout: 60000 }, async (t) => {
+  const { page } = await setupPage(t);
+
+  await page.select('#game', 'ludo');
+  await waitForCapacityEnabled(page, false);
+
+  const form = await readFormState(page);
+  assert.equal(form.game, 'ludo');
+  assert.equal(form.capacity, '', '首次选飞行棋时人数必须仍为未选择');
+  assert.equal(form.capacityDisabled, false);
+
+  const options = await readCapacityOptions(page);
+  assert.deepEqual(options.map((o) => o.value), ['', '2', '3', '4']);
+  assert.equal(options.find((o) => o.selected).value, '', '选中的必须是“请选择人数上限”占位项');
+});
+
+// 切回“请选择游戏规则…”：人数重新禁用、值清空、旧的 4 人不再作为可提交选择；
+// 名称与时间保留。此时提交必须被页面明确拦截（缺规则），不发请求、不增房间；
+// 补选飞行棋（旧 4 人不得复活）与人数后，按此时的选择正常创建并复位。
+test('切回“请选择游戏规则”：人数禁用且旧人数不可提交，补选后按当前选择创建并复位', { timeout: 60000 }, async (t) => {
+  const { page, baseURL } = await setupPage(t);
+  const postBodies = trackRoomPosts(page);
+  const initialRows = await readRows(page);
+  assertSeedRows(initialRows);
+
+  const name = '切回空规则再补选';
+  await page.type('#name', name);
+  await page.select('#game', 'ludo');
+  await waitForCapacityEnabled(page, false);
+  await page.select('#capacity', '4');
+  await page.type('#turnSeconds', '60');
+  assert.equal((await readFormState(page)).capacity, '4');
+
+  // 切回占位项：人数控件回到初始禁用态，旧 4 人从控件中消失。
+  await page.select('#game', '');
+  await waitForGameValue(page, '');
+  let form = await readFormState(page);
+  assert.equal(form.game, '');
+  assert.equal(form.capacityDisabled, true, '切回未选规则后人数必须重新禁用');
+  assert.equal(form.capacity, '', '旧的 4 人不得残留在控件值中');
+  assert.deepEqual(
+    (await readCapacityOptions(page)).map((o) => [o.value, o.text]),
+    [['', '请先选择游戏规则']],
+  );
+  assert.equal(form.name, name, '名称不应随规则清空');
+  assert.equal(form.turnSeconds, '60', '时间限制不应随规则清空');
+
+  // 直接提交：页面明确指出缺少规则，不发出创建请求、不增加房间，内容保留。
+  await page.click('#submit');
+  await waitForAnyMessage(page);
+  const msg = await readMessage(page);
+  assert.ok(msg.className.includes('error'), `缺少规则必须被页面拦截，实际提示：${msg.text}`);
+  assert.equal(msg.text, '请选择游戏规则。', '应明确提示缺少游戏规则');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(postBodies.length, 0, '缺少规则时不得发出创建请求');
+  assert.equal((await readServerRooms(baseURL)).length, 2, '拦截时服务端不应新增记录');
+  assert.deepEqual(await readFormState(page), {
+    name,
+    game: '',
+    capacity: '',
+    capacityDisabled: true,
+    turnSeconds: '60',
+    submitDisabled: false,
+  }, '被拦截后名称与时间应保留，按钮恢复可用');
+  assert.deepEqual(await readRows(page), initialRows, '拦截时不应改动房间列表');
+
+  // 补选飞行棋：人数必须保持未选择——先前的 4 人不能悄悄复活为可提交值。
+  await page.select('#game', 'ludo');
+  await waitForCapacityEnabled(page, false);
+  assert.equal(
+    (await readFormState(page)).capacity,
+    '',
+    '重新选飞行棋不应恢复切空前的 4 人',
+  );
+
+  // 按此时的规则与人数（ludo / 2）补齐并创建。
+  const createdPromise = nextCreated(page);
+  await page.select('#capacity', '2');
+  await page.click('#submit');
+
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+  assert.equal(postBodies.length, 1, '补齐后应只发出一次创建请求');
+  assert.deepEqual(JSON.parse(postBodies[0]), {
+    name,
+    game: 'ludo',
+    capacity: 2,
+    turnSeconds: 60,
+  }, '提交值必须对补齐时的规则与人数，而不是切空前的 4 人');
+  assert.equal(created.game, 'ludo');
+  assert.equal(created.capacity, 2, '服务端应按补选后的 2 人保存');
+  const okMsg = await readMessage(page);
+  assert.equal(okMsg.text, SUCCESS_PREFIX + created.id);
+
+  // 列表在原有房间之后追加，规则与人数与最终选择一致，原有内容次序不变。
+  await waitForRowCount(page, 3);
+  const rows = await readRows(page);
+  assert.deepEqual(rows.slice(0, 2), initialRows, '原有房间的内容或次序被改变');
+  assert.equal(rows[2].cells[0], created.id);
+  assert.equal(rows[2].cells[1], name);
+  assert.equal(rows[2].cells[2], '飞行棋');
+  assert.equal(rows[2].cells[3], '2 人');
+  assert.equal(rows[2].cells[4], '60 秒');
+
+  // 成功后表单复位：人数回到不可填写的初始状态，等待下一次选择规则。
+  await waitForFormReset(page);
+  assert.deepEqual(await readFormState(page), {
+    name: '',
+    game: '',
+    capacity: '',
+    capacityDisabled: true,
+    turnSeconds: '',
+    submitDisabled: false,
+  });
+});
+
+// 首次选择飞行棋后没有选择人数：提交被页面明确拦截（缺人数），不发请求、
+// 不增房间，已填内容（含已选规则）保留；补齐为 3 人后按 ludo/3 正常创建，
+// 证明飞行棋的 3 人不会被错误保存成 2 人；成功后人数回到禁用初始态。
+test('首次选飞行棋未选人数被页面拦截：不发请求、保留内容，补齐 3 人后按 ludo/3 创建并复位', { timeout: 60000 }, async (t) => {
+  const { page, baseURL } = await setupPage(t);
+  const postBodies = trackRoomPosts(page);
+  const initialRows = await readRows(page);
+  assertSeedRows(initialRows);
+
+  const name = '首飞未选人数';
+  await page.type('#name', name);
+  await page.select('#game', 'ludo');
+  await waitForCapacityEnabled(page, false);
+  await page.type('#turnSeconds', '90');
+
+  // 人数保持未选择直接提交：页面拦截并明确指出缺少人数。
+  await page.click('#submit');
+  await waitForAnyMessage(page);
+  const msg = await readMessage(page);
+  assert.ok(msg.className.includes('error'), `未选人数必须被页面拦截，实际提示：${msg.text}`);
+  assert.equal(msg.text, '请选择人数上限。', '应明确提示缺少人数上限');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(postBodies.length, 0, '未选人数时不得发出创建请求');
+  assert.equal((await readServerRooms(baseURL)).length, 2, '服务端不应新增记录');
+  assert.deepEqual(await readFormState(page), {
+    name,
+    game: 'ludo',
+    capacity: '',
+    capacityDisabled: false,
+    turnSeconds: '90',
+    submitDisabled: false,
+  }, '被拦截后已填名称、规则与时间应保留');
+  assert.deepEqual(await readRows(page), initialRows, '拦截时不应改动房间列表');
+
+  // 补齐为 3 人后正常创建，请求体、创建结果、服务端记录与列表全部为 ludo/3。
+  const createdPromise = nextCreated(page);
+  await page.select('#capacity', '3');
+  await page.click('#submit');
+
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+  assert.equal(postBodies.length, 1);
+  assert.deepEqual(JSON.parse(postBodies[0]), {
+    name,
+    game: 'ludo',
+    capacity: 3,
+    turnSeconds: 90,
+  });
+  assert.equal(created.game, 'ludo');
+  assert.equal(created.capacity, 3, '飞行棋 3 人必须按 3 保存，不能存成 2');
+
+  await waitForRowCount(page, 3);
+  const rows = await readRows(page);
+  assert.deepEqual(rows.slice(0, 2), initialRows, '原有房间的内容或次序被改变');
+  assertRoomRowCells(rows[2], created, {
+    gameText: '飞行棋', capText: '3 人', turnText: '90 秒',
+  });
+
+  // 复位后人数重新禁用；再次选择规则时控件重新按规则联动。
+  await waitForFormReset(page);
+  assert.equal((await readFormState(page)).capacityDisabled, true);
+  await page.select('#game', 'gomoku');
+  await waitForCapacityEnabled(page, false);
+});
+
+// 切换过程与最终提交必须严格对应，连续三轮创建：
+//   1. 飞行棋选 4 → 改选五子棋：提交 gomoku/2（不能带着先前的 ludo/4）；
+//   2. 五子棋（自动 2）→ 改飞行棋选 3：提交 ludo/3（不能存成 2）；
+//   3. 飞行棋直接选 4：提交 ludo/4（不能存成 2）。
+// 每轮都逐项对照请求体、创建结果、服务端记录与列表新行；已有房间内容次序不变。
+test('多次切换后创建：请求体、创建结果、服务端记录与列表始终对应当前规则与人数', { timeout: 60000 }, async (t) => {
+  const { page, baseURL } = await setupPage(t);
+  const tracked = trackRoomCreates(page);
+  const initialRows = await readRows(page);
+  assertSeedRows(initialRows);
+
+  // 第一轮：飞行棋选 4 人后改选五子棋，显示与提交都必须是 gomoku/2。
+  await page.type('#name', '四人飞行棋改五子棋');
+  await page.select('#game', 'ludo');
+  await waitForCapacityEnabled(page, false);
+  await page.select('#capacity', '4');
+  await page.select('#game', 'gomoku');
+  await waitForCapacityEnabled(page, false);
+  await page.type('#turnSeconds', '30');
+  await page.click('#submit');
+
+  // 先核对真正发出的请求体：页面显示的人数与提交保存的值必须严格对应。
+  const clientErr1 = await waitForPostOrClientError(page, tracked.posts, 1);
+  assert.equal(clientErr1, null, `页面不应在客户端拦截本次提交：${clientErr1}`);
+  assert.deepEqual(JSON.parse(tracked.posts[0]), {
+    name: '四人飞行棋改五子棋',
+    game: 'gomoku',
+    capacity: 2,
+    turnSeconds: 30,
+  }, '最终规则为五子棋时，请求不得携带先前飞行棋的 4 人或 ludo');
+  await tracked.waitForCount(1);
+  const created1 = tracked.rooms[0];
+  assert.equal(created1.game, 'gomoku');
+  assert.equal(created1.capacity, 2);
+  await waitForMessageKind(page, 'ok');
+  assert.equal((await readMessage(page)).text, SUCCESS_PREFIX + created1.id);
+
+  await waitForRowCount(page, 3);
+  let rows = await readRows(page);
+  assert.deepEqual(rows.slice(0, 2), initialRows, '原有房间的内容或次序被改变');
+  assertRoomRowCells(rows[2], created1, {
+    gameText: '五子棋', capText: '2 人', turnText: '30 秒',
+  });
+  const rowsAfter1 = rows;
+  await waitForFormReset(page);
+
+  // 第二轮：先选五子棋再改飞行棋并选 3 人，提交必须是 ludo/3。
+  await page.type('#name', '五子棋改三人飞行棋');
+  await page.select('#game', 'gomoku');
+  await waitForCapacityEnabled(page, false);
+  await page.select('#game', 'ludo');
+  await waitForCapacityEnabled(page, false);
+  await page.select('#capacity', '3');
+  await page.type('#turnSeconds', '45');
+  await page.click('#submit');
+
+  const clientErr2 = await waitForPostOrClientError(page, tracked.posts, 2);
+  assert.equal(clientErr2, null, `页面不应在客户端拦截本次提交：${clientErr2}`);
+  assert.deepEqual(JSON.parse(tracked.posts[1]), {
+    name: '五子棋改三人飞行棋',
+    game: 'ludo',
+    capacity: 3,
+    turnSeconds: 45,
+  }, '飞行棋选 3 人时必须提交 capacity 3');
+  await tracked.waitForCount(2);
+  const created2 = tracked.rooms[1];
+  assert.equal(created2.game, 'ludo');
+  assert.equal(created2.capacity, 3, '飞行棋 3 人不能被保存成 2 人');
+  await waitForMessageKind(page, 'ok');
+  assert.equal((await readMessage(page)).text, SUCCESS_PREFIX + created2.id);
+
+  await waitForRowCount(page, 4);
+  rows = await readRows(page);
+  assert.deepEqual(rows.slice(0, 3), rowsAfter1, '前三行（含上一轮新房间）的内容或次序被改变');
+  assertRoomRowCells(rows[3], created2, {
+    gameText: '飞行棋', capText: '3 人', turnText: '45 秒',
+  });
+  const rowsAfter2 = rows;
+  await waitForFormReset(page);
+
+  // 第三轮：飞行棋直接选 4 人，提交必须是 ludo/4。
+  await page.type('#name', '直接四人飞行棋');
+  await page.select('#game', 'ludo');
+  await waitForCapacityEnabled(page, false);
+  await page.select('#capacity', '4');
+  await page.type('#turnSeconds', '60');
+  await page.click('#submit');
+
+  const clientErr3 = await waitForPostOrClientError(page, tracked.posts, 3);
+  assert.equal(clientErr3, null, `页面不应在客户端拦截本次提交：${clientErr3}`);
+  assert.deepEqual(JSON.parse(tracked.posts[2]), {
+    name: '直接四人飞行棋',
+    game: 'ludo',
+    capacity: 4,
+    turnSeconds: 60,
+  }, '飞行棋选 4 人时必须提交 capacity 4');
+  await tracked.waitForCount(3);
+  const created3 = tracked.rooms[2];
+  assert.equal(created3.game, 'ludo');
+  assert.equal(created3.capacity, 4, '飞行棋 4 人不能被保存成 2 人');
+  await waitForMessageKind(page, 'ok');
+  assert.equal((await readMessage(page)).text, SUCCESS_PREFIX + created3.id);
+
+  await waitForRowCount(page, 5);
+  rows = await readRows(page);
+  assert.deepEqual(rows.slice(0, 4), rowsAfter2, '前四行（含前两轮新房间）的内容或次序被改变');
+  assertRoomRowCells(rows[4], created3, {
+    gameText: '飞行棋', capText: '4 人', turnText: '60 秒',
+  });
+
+  // 服务端实际保存记录同样逐间对照，三个新房间的规则与人数各不相同且与选择一致。
+  const serverRooms = await readServerRooms(baseURL);
+  assert.equal(serverRooms.length, 5);
+  assert.deepEqual(
+    serverRooms.slice(0, 2).map((r) => r.id),
+    ['seed-alpha', 'seed-beta'],
+    '原有房间在服务端的内容或次序被改变',
+  );
+  assert.deepEqual(
+    serverRooms.slice(2).map((r) => [r.id, r.game, r.capacity]),
+    [
+      [created1.id, 'gomoku', 2],
+      [created2.id, 'ludo', 3],
+      [created3.id, 'ludo', 4],
+    ],
+    '服务端保存的规则与人数必须逐间对应最终选择',
+  );
+
+  // 最后一轮成功后人数同样回到不可填写的初始状态。
+  await waitForFormReset(page);
 });
