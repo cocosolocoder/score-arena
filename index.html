@@ -28,6 +28,7 @@
   th { color: #52606d; font-size: .85rem; white-space: nowrap; }
   td.id, code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; word-break: break-all; }
   .empty { color: #616e7c; }
+  .skip-notice { background: #fff8e6; border: 1px solid #f0d48a; color: #7c4a03; padding: .6rem .9rem; border-radius: .35rem; margin: 0 0 1rem; }
   .list-error { color: #9b1c1c; }
   .badge { display: inline-block; padding: .05rem .55rem; border-radius: 999px; background: #fff3c4; color: #7c4a03; font-size: .85rem; }
   .meta { color: #7b8794; font-size: .85rem; }
@@ -235,15 +236,50 @@
     return { text: text, title: iso };
   }
 
+  // 只有 JSON 对象能作为房间行；null、字符串、数字、布尔值和数组都跳过。
+  // 不按创建表单的规则重新判定历史记录：对象带多少附加字段都照常展示，
+  // 也不检查其字段是否完整或合法（各单元格沿用现有兜底显示）。
+  function isRoomRecord(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function appendSkipNotice(skipped, allSkipped) {
+    var p = document.createElement('p');
+    p.className = 'skip-notice';
+    if (allSkipped) {
+      p.textContent = '没有可展示的房间。本次返回的房间记录中有 ' + skipped +
+        ' 条无法作为房间显示，已全部跳过；原始数据仍保留在服务端，未被删除或改写。';
+    } else {
+      p.textContent = '有 ' + skipped + ' 条房间记录无法作为房间显示，已跳过；' +
+        '原始数据仍保留在服务端，未被删除或改写。';
+    }
+    listArea.appendChild(p);
+  }
+
   function renderRooms(rooms) {
     listArea.innerHTML = '';
-    if (!rooms.length) {
-      var p = document.createElement('p');
-      p.className = 'empty';
-      p.textContent = '还没有房间记录。';
-      listArea.appendChild(p);
+
+    var validRooms = [];
+    var skipped = 0;
+    rooms.forEach(function (r) {
+      if (isRoomRecord(r)) validRooms.push(r);
+      else skipped++;
+    });
+
+    if (!validRooms.length) {
+      if (skipped > 0) {
+        appendSkipNotice(skipped, true);
+      } else {
+        var pEmpty = document.createElement('p');
+        pEmpty.className = 'empty';
+        pEmpty.textContent = '还没有房间记录。';
+        listArea.appendChild(pEmpty);
+      }
       return;
     }
+
+    if (skipped > 0) appendSkipNotice(skipped, false);
+
     var table = document.createElement('table');
     table.innerHTML =
       '<thead><tr>' +
@@ -251,7 +287,7 @@
       '<th>时间限制</th><th>状态</th><th>创建时间</th>' +
       '</tr></thead>';
     var tbody = document.createElement('tbody');
-    rooms.forEach(function (r) {
+    validRooms.forEach(function (r) {
       var tr = document.createElement('tr');
 
       var tdId = document.createElement('td');
