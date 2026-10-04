@@ -295,17 +295,25 @@
     listArea.appendChild(table);
   }
 
+  // 列表区域只认“本页最近一次发起的列表查询”。每次发起查询都递增序号，
+  // 响应（成功、错误状态、无法解析或连接失败）返回时，若已有更新的查询发出，
+  // 就直接丢弃本次结果：较早的查询即使更晚返回，也不能覆盖、清空列表，
+  // 也不能清除更新查询已经展示的加载失败提示。
+  var listRequestSeq = 0;
   function loadRooms() {
+    var seq = ++listRequestSeq;
     return fetch('/api/rooms', { headers: { 'Accept': 'application/json' } })
       .then(function (resp) {
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         return resp.json();
       })
       .then(function (data) {
+        if (seq !== listRequestSeq) return;
         var rooms = Array.isArray(data && data.rooms) ? data.rooms : [];
         renderRooms(rooms);
       })
       .catch(function () {
+        if (seq !== listRequestSeq) return;
         listArea.innerHTML = '';
         var p = document.createElement('p');
         p.className = 'list-error';
