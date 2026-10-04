@@ -546,6 +546,103 @@ func TestCreateRoomFailsWhenDataOnlyWhitespace(t *testing.T) {
 	assertCreateFailsOnUnreadableData(t, baseURL, dataDir, seed)
 }
 
+// 历史房间数组里混有非对象记录（null、字符串、数字、布尔值、数组——含空数组与
+// 内部装着房间对象的数组）以及带额外字段或缺字段的对象时，GET /api/rooms 必须
+// 把全部元素按数量、次序与原始类型原样返回：页面展示层正是依据“是不是 JSON 对象”
+// 决定能否成为房间行，接口层不能提前过滤、丢弃或展开任何一条记录。
+// 仅读取列表不得改写磁盘文件；随后合法创建房间时，原有混合记录仍要原位保留，
+// 新房间对象追加在最后。
+func TestGetRoomsPreservesMixedRawRecords(t *testing.T) {
+	dataDir := t.TempDir()
+	mixed := []string{
+		seedRecord1, // 完整对象，附带 note/tags 额外字段
+		`null`,
+		`"误入的字符串"`,
+		`""`, // 空字符串不能因其为空而漏计
+		`0`,  // 数字 0 不能因其为假值而漏计
+		`42`,
+		`false`, // 布尔 false 不能因其为假值而漏计
+		`true`,
+		`[]`,                      // 空数组：一条非对象记录，不是“没有记录”
+		`[{"id":"inside-array"}]`, // 装着对象的数组：整体一条记录，不能展开
+		`{"id":"only-id"}`,        // 缺字段对象：仍是一条对象记录
+	}
+	seed := seedRooms(t, dataDir, mixed...)
+	baseURL := startServer(t, dataDir)
+
+	status, rooms := getRooms(t, baseURL)
+	if status != http.StatusOK {
+		t.Fatalf("GET /api/rooms 状态码 = %d，期望 200", status)
+	}
+	if len(rooms) != len(mixed) {
+		t.Fatalf("返回记录数量 = %d，期望 %d（非对象记录不得被丢弃）", len(rooms), len(mixed))
+	}
+
+	// 与种子逐元素比对（解码后的值、次序、类型与附带字段完全一致）。
+	if want := decodeRecords(t, seed); !reflect.DeepEqual(rooms, want) {
+		t.Fatalf("混合记录未被原样保留：\n得到: %v\n期望: %v", rooms, want)
+	}
+
+	// 逐位置钉住原始类型，防止“看起来数量对”但元素被转换或重新排序。
+	if rooms[1] != nil {
+		t.Fatalf("第 2 条应为 null，实际 %v (%T)", rooms[1], rooms[1])
+	}
+	if got := rooms[2]; got != "误入的字符串" {
+		t.Fatalf("字符串记录应为 %q，实际 %v", "误入的字符串", got)
+	}
+	if got := rooms[3]; got != "" {
+		t.Fatalf("空字符串记录应保留为空串，实际 %v (%T)", got, got)
+	}
+	if got := rooms[4]; got != float64(0) {
+		t.Fatalf("数字 0 记录应保留为 0，实际 %v (%T)", got, got)
+	}
+	if got := rooms[6]; got != false {
+		t.Fatalf("布尔 false 记录应保留为 false，实际 %v (%T)", got, got)
+	}
+	arr, ok := rooms[8].([]any)
+	if !ok {
+		t.Fatalf("空数组记录应保留为数组类型，实际 %T", rooms[8])
+	}
+	if len(arr) != 0 {
+		t.Fatalf("空数组记录不应被展开或填充，实际 %v", arr)
+	}
+	nested, ok := rooms[9].([]any)
+	if !ok || len(nested) != 1 {
+		t.Fatalf("装对象的数组应整体保留为仅含 1 个元素的数组，实际 %v", rooms[9])
+	}
+	if inner, _ := nested[0].(map[string]any); inner["id"] != "inside-array" {
+		t.Fatalf("数组内对象应原样保留在数组内部，实际 %v", nested[0])
+	}
+	if partial, ok := rooms[10].(map[string]any); !ok || len(partial) != 1 || partial["id"] != "only-id" {
+		t.Fatalf("缺字段对象应原样保留为对象记录，实际 %v", rooms[10])
+	}
+	if first, _ := rooms[0].(map[string]any); first["note"] != "保留我" {
+		t.Fatalf("首条对象的附带字段应原样保留，实际 %v", rooms[0])
+	}
+
+	// 只读取列表不得产生任何写入：磁盘文件与种子逐字节一致。
+	if got := readDataFile(t, dataDir); !bytes.Equal(got, seed) {
+		t.Fatalf("读取列表改写了数据文件：\n得到: %s\n期望: %s", got, seed)
+	}
+
+	// 混合数据下合法创建房间：原有 11 条混合记录原位保留，新对象追加在最后。
+	createStatus, created := postRoom(t, baseURL, `{"name":"混合数据新建房","game":"gomoku","capacity":2,"turnSeconds":0}`)
+	if createStatus != http.StatusCreated {
+		t.Fatalf("混合历史数据下创建状态码 = %d，期望 201，响应: %v", createStatus, created)
+	}
+	_, after := getRooms(t, baseURL)
+	if len(after) != len(mixed)+1 {
+		t.Fatalf("创建后记录数量 = %d，期望 %d（原记录一条不少 + 新房间 1 条）", len(after), len(mixed)+1)
+	}
+	if !reflect.DeepEqual(after[:len(mixed)], decodeRecords(t, seed)) {
+		t.Fatalf("创建后原有混合记录被改动：\n得到: %v", after[:len(mixed)])
+	}
+	last, ok := after[len(after)-1].(map[string]any)
+	if !ok || last["id"] != created["id"] {
+		t.Fatalf("新房间应作为对象追加在最后，实际 %v", after[len(after)-1])
+	}
+}
+
 // 只含会被去掉的首尾空白（含 U+0085、U+00A0）的名称视为空，
 // 返回 400 并说明名称不能为空，不返回新房间编号，已有数据保持不变。
 func TestCreateRoomRejectedWhenNameOnlyWhitespace(t *testing.T) {

@@ -1,0 +1,445 @@
+// 首页“房间列表混合记录展示”的界面回归测试。
+//
+// 与另外三个浏览器回归文件的分工：
+//   - ui.test.mjs：创建成功/被拒、成功后列表竞态刷新、名称整理与长度边界；
+//   - ui-capacity-linkage.test.mjs：游戏规则与人数上限的联动；
+//   - ui-turn-seconds.test.mjs：每步时间限制的填写、提交与展示；
+//   - 本文件只盯住“打开首页查看房间列表”：接口返回的数组里混着房间对象与
+//     null、字符串、数字、布尔值、数组等非对象记录时，用户实际看到的列表。
+//
+// 保护的已有行为（本文件不修改任何产品代码，只补回归保障）：
+//   - 只有 JSON 对象能成为房间行；null、字符串、数字、布尔值、数组一律跳过，
+//     一条非对象记录不能拖累其他房间（它前后的房间对象都要照常显示），
+//     也不能让整份列表显示加载失败；
+//   - 房间行只按对象在返回数组中的相对次序排列，编号、名称、规则中文名
+//     （五子棋/飞行棋）、人数、时间（0 显示“不限时”）、状态（waiting 显示
+//     “未开始”）、创建时间沿用现有页面展示；
+//   - “能否作为房间行”与创建房间时的配置校验无关：对象带额外字段照常展示，
+//     缺少部分字段（乃至空对象）仍然成行且不计入跳过数量，单元格沿用现有
+//     兜底显示；
+//   - 空数组以及内部装着房间对象的数组都只是“一条数组记录”，跳过且不展开；
+//     空字符串、数字 0、布尔值 false 不能因为内容为空或值为假而漏计；
+//   - 列表区域必须给出准确跳过条数，并说明原始数据仍保留在服务端，未被删除
+//     或改写；数组非空但全部被跳过时，说明“没有可展示的房间”与全部跳过的
+//     数量，不出表格、不显示“还没有房间记录”；只有真正的空数组才显示空列表
+//     提示且没有跳过警告；
+//   - 查看列表本身是只读操作：接口返回的原始记录与本地 rooms.json 的数量、
+//     次序、类型与附带字段保持不变；混排数据下创建房间，原始记录也原样保留，
+//     新房间作为对象照常追加为最后一行。
+//
+// 运行：npm test（需要系统 Chrome，可用 CHROME_PATH 指定路径）。
+
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { execFile, spawn } from 'node:child_process';
+import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { promisify } from 'node:util';
+import puppeteer from 'puppeteer-core';
+
+const repoRoot = import.meta.dirname;
+const chromePath = process.env.CHROME_PATH || '/usr/bin/google-chrome';
+
+let serverBin;
+let browser;
+
+// 两类正常房间：R1 飞行棋 4 人 30 秒 playing（非 waiting 状态原文展示），
+// R2 五子棋 2 人 0 秒 waiting（“不限时”“未开始”两个关键中文映射）。
+// R1 附带 note/tags 额外字段，与其他回归文件一样用于确认附带字段不影响展示。
+const R1 =
+  '{"id":"mix-alpha","name":"晨间混播飞行棋","game":"ludo","capacity":4,"turnSeconds":30,' +
+  '"status":"playing","visibility":"public","createdAt":"2026-02-03T08:30:00Z",' +
+  '"note":"原样保留","tags":["混排","回归"]}';
+const R2 =
+  '{"id":"mix-beta","name":"午夜混播五子棋","game":"gomoku","capacity":2,"turnSeconds":0,' +
+  '"status":"waiting","visibility":"public","createdAt":"2026-02-04T23:15:00Z"}';
+// 带额外字段的完整房间：额外字段不得产生新列或影响既有列。
+const R3_EXTRA =
+  '{"id":"mix-extra","name":"多字段飞行棋","game":"ludo","capacity":3,"turnSeconds":600,' +
+  '"status":"waiting","visibility":"public","createdAt":"2026-02-05T12:00:00Z",' +
+  '"weird":true,"nested":{"rank":1},"tail":[1,2,3]}';
+// 缺少 turnSeconds/status/visibility/createdAt 的对象：仍是房间行，不计跳过，
+// 缺字段的单元格沿用页面现有兜底显示。
+const R4_PARTIAL = '{"id":"mix-partial","name":"缺字段五子棋","game":"gomoku","capacity":2}';
+// 空对象同样是对象：必须成行、不计跳过，各单元格走兜底。
+const R5_EMPTY = '{}';
+
+// 装在数组里的房间对象：整个数组只算一条非对象记录，绝不能展开成房间行。
+const INNER_ROOM =
+  '{"id":"inside-array","name":"数组里的房间不应展开","game":"gomoku","capacity":2,' +
+  '"turnSeconds":0,"status":"waiting","createdAt":"2026-02-06T00:00:00Z"}';
+
+// 全类型混排：9 条非对象记录（含空串/0/false/空数组/装对象的数组）穿插在
+// 房间对象之间，用来证明非对象记录既不拖累前一个房间，也不拖累后一个房间。
+const MIXED_RECORDS = [
+  R1,
+  'null',
+  '""',
+  '"一段普通字符串"',
+  '0',
+  '42',
+  'false',
+  'true',
+  '[]',
+  '[' + INNER_ROOM + ']',
+  R2,
+  R3_EXTRA,
+  R4_PARTIAL,
+  R5_EMPTY,
+];
+const MIXED_SKIPPED = 9;
+const MIXED_ROW_COUNT = 5;
+
+const EMPTY_TEXT = '还没有房间记录。';
+const SUCCESS_PREFIX = '房间已创建，编号：';
+
+before(async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'score-arena-uibin-'));
+  serverBin = path.join(dir, 'score-arena');
+  await promisify(execFile)('go', ['build', '-o', serverBin, '.'], { cwd: repoRoot });
+  browser = await puppeteer.launch({
+    executablePath: chromePath,
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'],
+  });
+});
+
+after(async () => {
+  if (browser) await browser.close();
+  if (serverBin) await rm(path.dirname(serverBin), { recursive: true, force: true });
+});
+
+function startServer(t, dataDir) {
+  const proc = spawn(
+    serverBin,
+    ['serve', '--host', '127.0.0.1', '--port', '0', '--data-dir', dataDir],
+    { stdio: ['ignore', 'pipe', 'inherit'] },
+  );
+  t.after(() => { proc.kill('SIGKILL'); });
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    const timer = setTimeout(() => reject(new Error('等待服务监听地址超时')), 15000);
+    proc.stdout.on('data', (chunk) => {
+      buf += chunk.toString();
+      const m = buf.match(/listening on (http:\/\/\S+)/);
+      if (m) {
+        clearTimeout(timer);
+        resolve(m[1]);
+      }
+    });
+    proc.on('exit', (code) => {
+      clearTimeout(timer);
+      reject(new Error(`服务在输出监听地址前退出，退出码 ${code}`));
+    });
+  });
+}
+
+// seedRecords 以原始 JSON 片段写 rooms.json，返回写入的确切文本，
+// 供“读取不改写文件”的逐字节比对使用。
+async function seedRecords(dataDir, records) {
+  const content = '[\n' + records.join(',\n') + '\n]\n';
+  await writeFile(path.join(dataDir, 'rooms.json'), content);
+  return content;
+}
+
+async function setupMixedPage(t, records) {
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'score-arena-uidata-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const seedText = await seedRecords(dataDir, records);
+  const baseURL = await startServer(t, dataDir);
+  const page = await browser.newPage();
+  t.after(() => page.close());
+  await page.goto(baseURL, { waitUntil: 'load' });
+  return { page, baseURL, dataDir, seedText };
+}
+
+function waitForRowCount(page, n) {
+  return page.waitForFunction(
+    (want) => document.querySelectorAll('#list-area table tbody tr').length === want,
+    { timeout: 10000 },
+    n,
+  );
+}
+
+// readRows 读取每行单元格文本、创建时间 title（原始 ISO）与状态徽标文本。
+function readRows(page) {
+  return page.$$eval('#list-area table tbody tr', (trs) =>
+    trs.map((tr) => {
+      const tds = [...tr.querySelectorAll('td')];
+      return {
+        cells: tds.map((td) => td.textContent),
+        timeTitle: tds[6] ? tds[6].getAttribute('title') : null,
+        badge: tds[5] && tds[5].querySelector('.badge')
+          ? tds[5].querySelector('.badge').textContent
+          : null,
+      };
+    }),
+  );
+}
+
+function readListArea(page) {
+  return page.evaluate(() => ({
+    text: document.getElementById('list-area').textContent,
+    hasTable: !!document.querySelector('#list-area table'),
+    rowCount: document.querySelectorAll('#list-area table tbody tr').length,
+    skipText: document.querySelector('#list-area .skip-notice')
+      ? document.querySelector('#list-area .skip-notice').textContent
+      : null,
+    skipCount: document.querySelectorAll('#list-area .skip-notice').length,
+    errorText: document.querySelector('#list-area .list-error')
+      ? document.querySelector('#list-area .list-error').textContent
+      : null,
+    emptyTexts: [...document.querySelectorAll('#list-area .empty')].map((el) => el.textContent),
+  }));
+}
+
+function waitForSkipNotice(page) {
+  return page.waitForFunction(
+    () => !!document.querySelector('#list-area .skip-notice'),
+    { timeout: 10000 },
+  );
+}
+
+function waitForEmptyTip(page) {
+  return page.waitForFunction(
+    () => !!document.querySelector('#list-area .empty'),
+    { timeout: 10000 },
+  );
+}
+
+async function readServerRooms(baseURL) {
+  const res = await fetch(baseURL + '/api/rooms');
+  assert.equal(res.status, 200);
+  return (await res.json()).rooms;
+}
+
+// 填写并提交五子棋表单（人数固定 2 人由页面自动选中）。
+async function fillGomokuForm(page, name, turnSeconds) {
+  await page.type('#name', name);
+  await page.select('#game', 'gomoku');
+  await page.waitForFunction(
+    () => !document.getElementById('capacity').disabled &&
+      document.getElementById('capacity').value === '2',
+    { timeout: 5000 },
+  );
+  await page.type('#turnSeconds', String(turnSeconds));
+  await page.click('#submit');
+}
+
+function nextCreated(page) {
+  return new Promise((resolve, reject) => {
+    page.on('response', (resp) => {
+      if (resp.request().method() === 'POST' && resp.url().endsWith('/api/rooms')) {
+        resp.json().then(resolve, reject);
+      }
+    });
+  });
+}
+
+function waitForMessageKind(page, kind) {
+  return page.waitForFunction(
+    (cls) => document.getElementById('form-msg').classList.contains(cls),
+    { timeout: 10000 },
+    kind,
+  );
+}
+
+// 全类型混排：所有房间对象按相对次序成行，9 条非对象记录（含空串/0/false/
+// 空数组/装对象的数组）全部跳过且计数准确；跳过内容不成行、不展开、不导致
+// 加载失败；跳过提示同时说明原始数据仍保留在服务端。
+test('混合记录：房间对象全部按相对次序展示，非对象记录全部跳过并给出准确条数与保留说明', { timeout: 60000 }, async (t) => {
+  const { page } = await setupMixedPage(t, MIXED_RECORDS);
+
+  await waitForRowCount(page, MIXED_ROW_COUNT);
+  await waitForSkipNotice(page);
+  const list = await readListArea(page);
+
+  // 只有对象成为房间行：5 个对象（含缺字段对象与空对象），非对象记录不展开成行。
+  assert.equal(list.rowCount, MIXED_ROW_COUNT, '只有 JSON 对象应成为房间行');
+  assert.equal(list.hasTable, true, '存在可展示房间时应显示房间表格');
+
+  // 跳过条数准确：null、空串、普通字符串、0、42、false、true、空数组、
+  // 装对象的数组各算一条，共 9 条。
+  assert.equal(list.skipCount, 1, '列表区域应只有一条跳过提示');
+  assert.equal(
+    list.skipText,
+    '有 ' + MIXED_SKIPPED + ' 条房间记录无法作为房间显示，已跳过；' +
+      '原始数据仍保留在服务端，未被删除或改写。',
+    '跳过提示的条数或保留说明不正确',
+  );
+
+  // 跳过的内容不能导致整份列表失败。
+  assert.equal(list.errorText, null, '存在非对象记录不应导致列表加载失败');
+
+  // 数组里的房间对象不能被展开：其编号与名称不出现在列表区域，
+  // 普通字符串等原始内容也不应作为房间文本上屏。
+  assert.ok(!list.text.includes('inside-array'), '数组内的房间记录不能被展开成房间行');
+  assert.ok(!list.text.includes('数组里的房间不应展开'), '数组内容不能上屏');
+  assert.ok(!list.text.includes('一段普通字符串'), '被跳过的字符串不能上屏');
+
+  const rows = await readRows(page);
+  // 房间行严格按对象在返回数组中的相对次序排列：
+  // R1（最前）→ R2（跳过段之后）→ R3 → R4 → R5。
+  assert.deepEqual(
+    rows.map((r) => r.cells[0]),
+    ['mix-alpha', 'mix-beta', 'mix-extra', 'mix-partial', ''],
+    '房间行的排列次序应与对象在返回列表中的相对次序一致',
+  );
+
+  // R1：飞行棋中文名、4 人、30 秒、非 waiting 状态原文显示、创建时间保留原始 ISO。
+  assert.deepEqual(rows[0].cells.slice(0, 6), [
+    'mix-alpha', '晨间混播飞行棋', '飞行棋', '4 人', '30 秒', 'playing',
+  ]);
+  assert.equal(rows[0].badge, 'playing', '未知状态沿用原文展示');
+  assert.equal(rows[0].timeTitle, '2026-02-03T08:30:00Z');
+  assert.match(rows[0].cells[6], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+
+  // R2：五子棋中文名、0 秒显示“不限时”、waiting 显示“未开始”。
+  assert.deepEqual(rows[1].cells.slice(0, 6), [
+    'mix-beta', '午夜混播五子棋', '五子棋', '2 人', '不限时', '未开始',
+  ]);
+  assert.equal(rows[1].badge, '未开始', 'waiting 状态应以徽标显示“未开始”');
+  assert.equal(rows[1].timeTitle, '2026-02-04T23:15:00Z');
+
+  // R3：额外字段不产生新列、不改变既有列；600 秒端点正常显示。
+  assert.deepEqual(rows[2].cells.slice(0, 6), [
+    'mix-extra', '多字段飞行棋', '飞行棋', '3 人', '600 秒', '未开始',
+  ]);
+  assert.equal(rows[2].cells.length, 7, '额外字段不能导致列数变化');
+
+  // R4：缺字段对象仍是房间行（不计跳过），缺的单元格沿用现有兜底显示。
+  assert.deepEqual(rows[3].cells, [
+    'mix-partial', '缺字段五子棋', '五子棋', '2 人', 'undefined 秒', '', '',
+  ], '缺字段对象的单元格应沿用现有兜底显示');
+  assert.equal(rows[3].badge, '');
+  // 现有兜底：缺 createdAt 时单元格文本为空，title 属性被 DOM 序列化为 "undefined"。
+  assert.equal(rows[3].timeTitle, 'undefined');
+
+  // R5：空对象也是对象，同样成行且不计跳过，各单元格走兜底。
+  assert.deepEqual(rows[4].cells, [
+    '', '', '', ' 人', 'undefined 秒', '', '',
+  ], '空对象应作为房间行并沿用现有兜底显示');
+  assert.equal(rows[4].badge, '');
+  assert.equal(rows[4].timeTitle, 'undefined');
+});
+
+// 数组非空但所有元素都是非对象（且刻意包含空串、0、false、空数组这些
+// “空/假值”）：全部计入跳过，页面说明没有可展示的房间与全部跳过数量，
+// 不出房间表格，也不显示“还没有房间记录”，更不是加载失败。
+test('全部跳过：说明没有可展示房间与跳过总数，无表格、无空列表提示、无加载失败', { timeout: 60000 }, async (t) => {
+  const allSkipped = ['null', '""', '0', 'false', '[]'];
+  const { page } = await setupMixedPage(t, allSkipped);
+
+  await waitForSkipNotice(page);
+  // 给页面足够时间，确认不会迟来一个表格或空提示。
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const list = await readListArea(page);
+
+  assert.equal(
+    list.skipText,
+    '没有可展示的房间。本次返回的房间记录中有 5 条无法作为房间显示，已全部跳过；' +
+      '原始数据仍保留在服务端，未被删除或改写。',
+    '全部跳过时应说明没有可展示的房间以及准确的全部跳过数量',
+  );
+  assert.equal(list.skipCount, 1);
+  assert.equal(list.rowCount, 0, '非对象记录不能成为房间行');
+  assert.equal(list.hasTable, false, '没有可展示房间时不应出现房间表格');
+  assert.deepEqual(list.emptyTexts, [], '全部跳过时不应显示“还没有房间记录”');
+  assert.ok(!list.text.includes(EMPTY_TEXT), '全部跳过时不能出现空列表文案');
+  assert.equal(list.errorText, null, '跳过记录不是加载失败');
+});
+
+// 只有真正的空数组才显示空列表提示，且没有任何跳过警告。
+test('真正的空数组：显示空列表提示，没有跳过警告与表格', { timeout: 60000 }, async (t) => {
+  const { page } = await setupMixedPage(t, []);
+
+  await waitForEmptyTip(page);
+  const list = await readListArea(page);
+  assert.deepEqual(list.emptyTexts, [EMPTY_TEXT], '只有真正的空数组才显示空列表提示');
+  assert.equal(list.skipText, null, '空数组不应产生跳过警告');
+  assert.equal(list.hasTable, false);
+  assert.equal(list.errorText, null);
+});
+
+// 查看混合列表是只读操作：接口返回的原始记录保持数量、次序、原始类型与
+// 附带字段；本地 rooms.json 逐字节不变。刷新页面再看一次结果完全一致。
+test('查看混合列表后：接口原始记录与本地文件的数量、次序、类型、附带字段保持不变', { timeout: 60000 }, async (t) => {
+  const { page, baseURL, dataDir, seedText } = await setupMixedPage(t, MIXED_RECORDS);
+
+  await waitForRowCount(page, MIXED_ROW_COUNT);
+  await waitForSkipNotice(page);
+
+  // 接口返回与种子完全一致的结构（含 null/字符串/数字/布尔/数组的原始类型，
+  // 以及对象的附带字段）。
+  const expected = [
+    JSON.parse(R1), null, '', '一段普通字符串', 0, 42, false, true, [], [JSON.parse(INNER_ROOM)],
+    JSON.parse(R2), JSON.parse(R3_EXTRA), JSON.parse(R4_PARTIAL), {},
+  ];
+  const roomsOnce = await readServerRooms(baseURL);
+  assert.deepEqual(roomsOnce, expected, '接口返回的原始记录（数量、次序、类型、附带字段）被改动');
+
+  // 刷新页面再查看一次：用户看到的行与跳过提示保持一致。
+  await page.reload({ waitUntil: 'load' });
+  await waitForRowCount(page, MIXED_ROW_COUNT);
+  const list = await readListArea(page);
+  assert.equal(list.rowCount, MIXED_ROW_COUNT);
+  assert.ok(list.skipText && list.skipText.includes('' + MIXED_SKIPPED));
+  assert.deepEqual(
+    (await readRows(page)).map((r) => r.cells[0]),
+    ['mix-alpha', 'mix-beta', 'mix-extra', 'mix-partial', ''],
+  );
+
+  // 再次查询仍与原始结构一致；本地文件逐字节保持种子内容（读取不触发改写）。
+  assert.deepEqual(await readServerRooms(baseURL), expected, '再次查看后接口记录被改动');
+  const onDisk = await readFile(path.join(dataDir, 'rooms.json'), 'utf8');
+  assert.equal(onDisk, seedText, '查看列表不应改写本地保存的原始记录');
+});
+
+// 混合数据下创建公开房间的既有行为不变：原始的非对象记录与附带字段原样保留
+// 在原位置，新房间作为对象追加为最后一行，跳过数量不变、提示仍在。
+test('混合记录下创建房间：原始记录原位保留，新房间追加为最后一行，跳过计数不变', { timeout: 60000 }, async (t) => {
+  const seed = [R1, 'null', '"误入的字符串"', 'false', R2];
+  const { page, baseURL } = await setupMixedPage(t, seed);
+
+  await waitForRowCount(page, 2);
+  await waitForSkipNotice(page);
+  let list = await readListArea(page);
+  assert.equal(
+    list.skipText,
+    '有 3 条房间记录无法作为房间显示，已跳过；原始数据仍保留在服务端，未被删除或改写。',
+  );
+
+  const createdPromise = nextCreated(page);
+  await fillGomokuForm(page, '混排中新建的房间', 0);
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+  assert.ok(created.id, '创建结果应包含新房间编号');
+
+  // 列表刷新后：原有两个房间与新房间共 3 行，非对象记录仍跳过同样的 3 条。
+  await waitForRowCount(page, 3);
+  list = await readListArea(page);
+  assert.equal(list.rowCount, 3);
+  assert.equal(
+    list.skipText,
+    '有 3 条房间记录无法作为房间显示，已跳过；原始数据仍保留在服务端，未被删除或改写。',
+    '创建房间不应改变跳过条数或保留说明',
+  );
+  const rows = await readRows(page);
+  assert.deepEqual(
+    rows.map((r) => r.cells[0]),
+    ['mix-alpha', 'mix-beta', created.id],
+    '新房间应作为对象追加在原有房间之后，原始次序不变',
+  );
+  assert.equal(rows[2].cells[1], created.name);
+  assert.equal(rows[2].cells[4], '不限时');
+  assert.equal(rows[2].badge, '未开始');
+
+  // 服务端记录：5 条原始记录原位保留（含类型与附带字段），新对象追加在最后。
+  const serverRooms = await readServerRooms(baseURL);
+  assert.equal(serverRooms.length, 6, '原始记录一条不少，另加新建房间');
+  assert.deepEqual(serverRooms.slice(0, 5), [
+    JSON.parse(R1), null, '误入的字符串', false, JSON.parse(R2),
+  ], '原始记录的数量、次序、类型与附带字段必须原位保留');
+  assert.equal(serverRooms[5].id, created.id, '新房间应保存在最后');
+});
