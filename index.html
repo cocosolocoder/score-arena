@@ -29,6 +29,7 @@
   td.id, code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; word-break: break-all; }
   .empty { color: #616e7c; }
   .list-error { color: #9b1c1c; }
+  .skipped { color: #7c4a03; background: #fff8e6; border: 1px solid #f3d583; border-radius: .35rem; padding: .55rem .8rem; }
   .badge { display: inline-block; padding: .05rem .55rem; border-radius: 999px; background: #fff3c4; color: #7c4a03; font-size: .85rem; }
   .meta { color: #7b8794; font-size: .85rem; }
 </style>
@@ -235,15 +236,51 @@
     return { text: text, title: iso };
   }
 
+  // 只有普通 JSON 对象能作为房间行；null 的 typeof 也是 object，需单独排除，
+  // 数组另有判断。字符串、数字、布尔由 typeof 即可排除。对象即使带有不认识的
+  // 附加字段也照常显示，不按创建表单的规则重新判定历史记录。
+  function isRoomRecord(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  // 在列表区域追加跳过提示：计数以本次返回数组的元素为单位，
+  // 数组元素内部的内容不展开计数；同时说明原始数据仍保留。
+  function appendSkippedTip(count) {
+    var p = document.createElement('p');
+    p.className = 'skipped';
+    p.id = 'skipped-tip';
+    p.textContent = '有 ' + count + ' 条记录无法作为房间显示，已跳过；原始数据仍保留在服务端，未被删除或改写。';
+    listArea.appendChild(p);
+  }
+
   function renderRooms(rooms) {
     listArea.innerHTML = '';
+
+    // 无法作为房间显示的元素只跳过自身并计数，不能连累同批的正常房间。
+    var validRooms = [];
+    var skipped = 0;
+    rooms.forEach(function (r) {
+      if (isRoomRecord(r)) validRooms.push(r);
+      else skipped++;
+    });
+
     if (!rooms.length) {
-      var p = document.createElement('p');
-      p.className = 'empty';
-      p.textContent = '还没有房间记录。';
-      listArea.appendChild(p);
+      var empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = '还没有房间记录。';
+      listArea.appendChild(empty);
       return;
     }
+
+    if (!validRooms.length) {
+      var none = document.createElement('p');
+      none.className = 'empty';
+      none.textContent = '没有可展示的房间。';
+      listArea.appendChild(none);
+      appendSkippedTip(skipped);
+      return;
+    }
+
     var table = document.createElement('table');
     table.innerHTML =
       '<thead><tr>' +
@@ -251,7 +288,7 @@
       '<th>时间限制</th><th>状态</th><th>创建时间</th>' +
       '</tr></thead>';
     var tbody = document.createElement('tbody');
-    rooms.forEach(function (r) {
+    validRooms.forEach(function (r) {
       var tr = document.createElement('tr');
 
       var tdId = document.createElement('td');
@@ -293,6 +330,7 @@
     });
     table.appendChild(tbody);
     listArea.appendChild(table);
+    if (skipped > 0) appendSkippedTip(skipped);
   }
 
   // 列表查询序号：每次发起查询递增，只有当前最新一次查询的结果
