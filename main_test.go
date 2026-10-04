@@ -95,6 +95,16 @@ func seedRooms(t *testing.T, dataDir string, records ...string) []byte {
 	return []byte(content)
 }
 
+// writeDataFile 用原始内容直接覆盖 rooms.json（内容可以不是合法 JSON），返回写入的字节。
+func writeDataFile(t *testing.T, dataDir string, content string) []byte {
+	t.Helper()
+	raw := []byte(content)
+	if err := os.WriteFile(filepath.Join(dataDir, "rooms.json"), raw, 0o644); err != nil {
+		t.Fatalf("写入数据文件失败: %v", err)
+	}
+	return raw
+}
+
 func decodeRecords(t *testing.T, raw []byte) []any {
 	t.Helper()
 	var records []any
@@ -121,6 +131,25 @@ func postRoom(t *testing.T, baseURL, body string) (int, map[string]any) {
 	var decoded map[string]any
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		t.Fatalf("响应不是合法 JSON: %v（内容: %s）", err, payload)
+	}
+	return resp.StatusCode, decoded
+}
+
+// getRoomsResponse 查询房间列表，返回状态码与解码后的整个响应体（成功或失败均可）。
+func getRoomsResponse(t *testing.T, baseURL string) (int, map[string]any) {
+	t.Helper()
+	resp, err := httpClient.Get(baseURL + "/api/rooms")
+	if err != nil {
+		t.Fatalf("GET /api/rooms 失败: %v", err)
+	}
+	defer resp.Body.Close()
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取响应失败: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("房间列表响应不是合法 JSON: %v（内容: %s）", err, payload)
 	}
 	return resp.StatusCode, decoded
 }
@@ -433,4 +462,115 @@ func TestCreateRoomRejectedWhenNameOnlyWhitespace(t *testing.T) {
 	}
 
 	assertRoomsUnchanged(t, baseURL, dataDir, seed)
+}
+
+// 合法的创建请求体：名称、游戏规则、人数、每步时间全部合法，
+// 用于隔离"已有数据读不出来"这一失败原因（排除配置不合法的干扰）。
+const validCreateBody = `{"name":"读取保护验证房","game":"gomoku","capacity":2,"turnSeconds":30}`
+
+// assertCreateFailsOnUnreadableData 验证已有房间数据读不出来时的保护行为：
+// 合法创建必须返回 500 并说明是房间数据的读取/解析问题，不能当成没有房间继续追加；
+// 原数据文件逐字节保持不变；查询列表同样返回 500 而不是成功的空列表。
+func assertCreateFailsOnUnreadableData(t *testing.T, baseURL, dataDir string, original []byte) {
+	t.Helper()
+
+	status, body := postRoom(t, baseURL, validCreateBody)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("创建状态码 = %d，期望 500（读取已有数据失败不能当成没有房间），响应: %v", status, body)
+	}
+	errMsg, _ := body["error"].(string)
+	if errMsg == "" {
+		t.Fatalf("响应应包含非空 error 说明读取/解析失败，实际: %v", body)
+	}
+	if !strings.Contains(errMsg, "房间数据") {
+		t.Fatalf("error 应说明问题出在房间数据的读取或解析，实际: %q", errMsg)
+	}
+	if strings.Contains(errMsg, "缺少") || strings.Contains(errMsg, "不能为空") {
+		t.Fatalf("error 不应把责任归为用户漏填字段或配置不合法，实际: %q", errMsg)
+	}
+	if _, ok := body["id"]; ok {
+		t.Fatalf("读取失败不应返回新房间编号，实际: %v", body)
+	}
+	if _, ok := body["rooms"]; ok {
+		t.Fatalf("读取失败不应返回成功的房间对象或列表，实际: %v", body)
+	}
+
+	// 查询同一份数据也必须暴露读取失败，不能以成功的空列表掩盖问题。
+	listStatus, listBody := getRoomsResponse(t, baseURL)
+	if listStatus != http.StatusInternalServerError {
+		t.Fatalf("GET /api/rooms 状态码 = %d，期望 500，响应: %v", listStatus, listBody)
+	}
+	listErr, _ := listBody["error"].(string)
+	if !strings.Contains(listErr, "读取") || !strings.Contains(listErr, "房间数据") {
+		t.Fatalf("列表接口的 error 应明确说明房间数据读取失败，实际: %q", listErr)
+	}
+	if _, ok := listBody["rooms"]; ok {
+		t.Fatalf("读取失败不应返回房间列表（哪怕是空列表），实际: %v", listBody)
+	}
+
+	// 原数据与请求前完全相同：不能清空、改写成空数组、补齐损坏内容或留下新记录。
+	if got := readDataFile(t, dataDir); !bytes.Equal(got, original) {
+		t.Fatalf("数据文件被改动：\n得到: %s\n期望: %s", got, original)
+	}
+}
+
+// 已有数据被截断、缺少结束符而无法解析时，即使前半段仍能辨认出已有房间，
+// 也不能只保留可解析的部分继续追加；合法创建应返回 500，原数据逐字节保留。
+func TestCreateRoomFailsWhenDataTruncated(t *testing.T) {
+	dataDir := t.TempDir()
+	// 两条完整记录之后被截断：缺少第三条记录和结束的 "]"。
+	original := writeDataFile(t, dataDir, "[\n"+seedRecord1+",\n"+seedRecord2+",\n")
+	baseURL := startServer(t, dataDir)
+
+	assertCreateFailsOnUnreadableData(t, baseURL, dataDir, original)
+}
+
+// 已有内容是完整 JSON 但不是房间数组（单个对象）时，同样属于读不出已有数据，
+// 合法创建应返回 500，原数据逐字节保留。
+func TestCreateRoomFailsWhenDataIsObject(t *testing.T) {
+	dataDir := t.TempDir()
+	original := writeDataFile(t, dataDir, seedRecord1+"\n")
+	baseURL := startServer(t, dataDir)
+
+	assertCreateFailsOnUnreadableData(t, baseURL, dataDir, original)
+}
+
+// 已有数据只有空白、没有数组内容时按解析失败处理，
+// 不能套用首次使用时的空列表行为；合法创建应返回 500，原数据逐字节保留。
+func TestCreateRoomFailsWhenDataOnlyWhitespace(t *testing.T) {
+	dataDir := t.TempDir()
+	original := writeDataFile(t, dataDir, " \n\t\n")
+	baseURL := startServer(t, dataDir)
+
+	assertCreateFailsOnUnreadableData(t, baseURL, dataDir, original)
+}
+
+// 与读取失败区分：已有内容是空数组、前后带有正常 JSON 空白时属于合法空列表，
+// 创建应照常返回 201，查询能得到与创建响应一致的那一个新房间。
+func TestCreateRoomOnEmptyArrayWithWhitespace(t *testing.T) {
+	dataDir := t.TempDir()
+	writeDataFile(t, dataDir, "  [\n]\n\n")
+	baseURL := startServer(t, dataDir)
+
+	status, created := postRoom(t, baseURL, validCreateBody)
+	if status != http.StatusCreated {
+		t.Fatalf("创建状态码 = %d，期望 201，响应: %v", status, created)
+	}
+	if id, _ := created["id"].(string); id == "" {
+		t.Fatal("新房间编号为空")
+	}
+	if got, want := created["name"], "读取保护验证房"; got != want {
+		t.Fatalf("名称 = %v，期望 %q", got, want)
+	}
+
+	listStatus, rooms := getRooms(t, baseURL)
+	if listStatus != http.StatusOK {
+		t.Fatalf("GET /api/rooms 状态码 = %d，期望 200", listStatus)
+	}
+	if len(rooms) != 1 {
+		t.Fatalf("房间数量 = %d，期望 1", len(rooms))
+	}
+	if !reflect.DeepEqual(rooms[0], created) {
+		t.Fatalf("列表中的记录与创建响应不一致：\n列表: %v\n响应: %v", rooms[0], created)
+	}
 }
