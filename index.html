@@ -243,6 +243,15 @@
     return value !== null && typeof value === 'object' && !Array.isArray(value);
   }
 
+  // 单个字段的异常判定：字段值是 JSON 对象或数组时无法作为标量展示——
+  // 直接拼接或赋给 textContent 会触发对象转字符串（如 {"toString":"旧名称"}
+  // 会抛 TypeError），曾导致整表渲染中断、整份列表显示加载失败。
+  // 这类值只替换所在单元格为占位文本，不影响同行其他单元格与其他行。
+  function isAbnormalField(value) {
+    return value !== null && typeof value === 'object';
+  }
+  var ABNORMAL_FIELD_TEXT = '字段格式异常';
+
   function appendSkipNotice(skipped, allSkipped) {
     var p = document.createElement('p');
     p.className = 'skip-notice';
@@ -292,37 +301,45 @@
 
       var tdId = document.createElement('td');
       tdId.className = 'id';
-      tdId.textContent = r.id || '';
+      tdId.textContent = isAbnormalField(r.id) ? ABNORMAL_FIELD_TEXT : (r.id || '');
       tr.appendChild(tdId);
 
       var tdName = document.createElement('td');
-      tdName.textContent = r.name || '';
+      tdName.textContent = isAbnormalField(r.name) ? ABNORMAL_FIELD_TEXT : (r.name || '');
       tr.appendChild(tdName);
 
       var tdGame = document.createElement('td');
-      tdGame.textContent = GAME_LABELS[r.game] || r.game || '';
+      tdGame.textContent = isAbnormalField(r.game) ? ABNORMAL_FIELD_TEXT
+        : (GAME_LABELS[r.game] || r.game || '');
       tr.appendChild(tdGame);
 
       var tdCap = document.createElement('td');
-      tdCap.textContent = (r.capacity != null ? r.capacity : '') + ' 人';
+      tdCap.textContent = isAbnormalField(r.capacity) ? ABNORMAL_FIELD_TEXT
+        : (r.capacity != null ? r.capacity : '') + ' 人';
       tr.appendChild(tdCap);
 
       var tdTurn = document.createElement('td');
-      if (r.turnSeconds === 0) tdTurn.textContent = '不限时';
+      if (isAbnormalField(r.turnSeconds)) tdTurn.textContent = ABNORMAL_FIELD_TEXT;
+      else if (r.turnSeconds === 0) tdTurn.textContent = '不限时';
       else tdTurn.textContent = r.turnSeconds + ' 秒';
       tr.appendChild(tdTurn);
 
       var tdStatus = document.createElement('td');
       var badge = document.createElement('span');
       badge.className = 'badge';
-      badge.textContent = STATUS_LABELS[r.status] || r.status || '';
+      badge.textContent = isAbnormalField(r.status) ? ABNORMAL_FIELD_TEXT
+        : (STATUS_LABELS[r.status] || r.status || '');
       tdStatus.appendChild(badge);
       tr.appendChild(tdStatus);
 
       var tdTime = document.createElement('td');
-      var t = formatTime(r.createdAt || '');
-      tdTime.textContent = t.text;
-      tdTime.title = t.title;
+      if (isAbnormalField(r.createdAt)) {
+        tdTime.textContent = ABNORMAL_FIELD_TEXT;
+      } else {
+        var t = formatTime(r.createdAt || '');
+        tdTime.textContent = t.text;
+        tdTime.title = t.title;
+      }
       tr.appendChild(tdTime);
 
       tbody.appendChild(tr);
