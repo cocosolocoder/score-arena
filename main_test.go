@@ -509,6 +509,89 @@ func TestCreateRoomFailsWhenDataIsObjectNotArray(t *testing.T) {
 	assertCreateFailsOnUnreadableData(t, baseURL, dataDir, seed)
 }
 
+// 已有内容整体是 JSON null（含前后带合法 JSON 空白的情况）时，null 不表示
+// “还没有房间”：按数据约定顶层必须是数组，只有空数组才表示没有记录。
+// 查询与合法创建都必须返回 500，error 明确说明房间数据必须是数组，
+// 不返回成功的 rooms 内容或新房间编号，且文件逐字节保持为 null（不替换成
+// 空数组、不追加、不改写周围空白）。
+func TestRoomsFailWhenDataIsNull(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{name: "null", content: "null"},
+		{name: "null 带尾随换行", content: "null\n"},
+		{name: "null 前后带合法 JSON 空白", content: " \t\n null \r\n\t"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			seed := seedRaw(t, dataDir, tc.content)
+			baseURL := startServer(t, dataDir)
+
+			assertCreateFailsOnUnreadableData(t, baseURL, dataDir, seed)
+
+			// 在共用的 500 断言之外，再钉住 error 必须明确说明“数据必须是数组”，
+			// 让用户能把它与表单漏填、人数不合法等输入问题区分开。
+			getStatus, getBody := getRoomsResponse(t, baseURL)
+			if getStatus != http.StatusInternalServerError {
+				t.Fatalf("GET /api/rooms 状态码 = %d，期望 500，响应: %v", getStatus, getBody)
+			}
+			getErr, _ := getBody["error"].(string)
+			if !strings.Contains(getErr, "数组") {
+				t.Fatalf("GET 的 error 应明确说明房间数据必须是数组，实际: %q", getErr)
+			}
+
+			postStatus, postBody := postRoom(t, baseURL, `{"name":"空指针保护验证房","game":"ludo","capacity":3,"turnSeconds":60}`)
+			if postStatus != http.StatusInternalServerError {
+				t.Fatalf("创建状态码 = %d，期望 500，响应: %v", postStatus, postBody)
+			}
+			postErr, _ := postBody["error"].(string)
+			if !strings.Contains(postErr, "数组") {
+				t.Fatalf("创建的 error 应明确说明房间数据必须是数组，实际: %q", postErr)
+			}
+		})
+	}
+}
+
+// 仅含一个 null 元素的数组 [null] 仍是合法的房间数组：查询要原样返回其中的
+// null，合法创建在数组末尾追加新房间，不能借格式修复之名删除该元素。
+func TestNullElementInsideArrayStillSupported(t *testing.T) {
+	dataDir := t.TempDir()
+	seed := seedRaw(t, dataDir, "[null]\n")
+	baseURL := startServer(t, dataDir)
+
+	status, rooms := getRooms(t, baseURL)
+	if status != http.StatusOK {
+		t.Fatalf("GET /api/rooms 状态码 = %d，期望 200", status)
+	}
+	if len(rooms) != 1 {
+		t.Fatalf("返回记录数量 = %d，期望 1（数组中的 null 不得被丢弃）", len(rooms))
+	}
+	if rooms[0] != nil {
+		t.Fatalf("唯一记录应为 null，实际 %v (%T)", rooms[0], rooms[0])
+	}
+	if got := readDataFile(t, dataDir); !bytes.Equal(got, seed) {
+		t.Fatalf("仅读取列表不得改写数据文件：\n得到: %s\n期望: %s", got, seed)
+	}
+
+	createStatus, created := postRoom(t, baseURL, `{"name":"null 元素后的新房","game":"gomoku","capacity":2,"turnSeconds":0}`)
+	if createStatus != http.StatusCreated {
+		t.Fatalf("创建状态码 = %d，期望 201，响应: %v", createStatus, created)
+	}
+
+	_, after := getRooms(t, baseURL)
+	if len(after) != 2 {
+		t.Fatalf("创建后记录数量 = %d，期望 2（原 null + 新房间）", len(after))
+	}
+	if after[0] != nil {
+		t.Fatalf("原有的 null 元素应原位保留，实际 %v (%T)", after[0], after[0])
+	}
+	if last, ok := after[1].(map[string]any); !ok || last["id"] != created["id"] {
+		t.Fatalf("新房间应追加在 null 之后，实际: %v", after[1])
+	}
+}
+
 // 已有内容是带正常 JSON 空白的空数组时，属于合法空列表：
 // 创建应照常返回 201，查询能得到与创建响应一致的那一个新房间。
 func TestCreateRoomOnEmptyArrayWithWhitespace(t *testing.T) {

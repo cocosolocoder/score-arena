@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	_ "embed"
@@ -58,11 +59,19 @@ func newRoomStore(path string) *roomStore {
 
 // load 读取数据文件，返回顶层数组中的原始记录以及已占用的房间编号。
 // 文件无法读取或不是合法数组时返回错误，绝不重置已有数据。
-// 数组中的非对象元素原样保留（兼容历史记录及其附带字段）。
+// 顶层 JSON null（含前后合法 JSON 空白）不是“没有房间”：按公开约定
+// 房间数据必须是数组，只有空数组才表示没有记录，因此 null 必须报错，
+// 不能让查询返回成功的空列表，也不能让创建直接写入并覆盖原文件。
+// 数组中的非对象元素（如 null）原样保留（兼容历史记录及其附带字段）。
 func (s *roomStore) load() ([]json.RawMessage, map[string]bool, error) {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("读取房间数据失败: %w", err)
+	}
+	// json.Unmarshal 会把顶层 null 解成 nil 切片且不报错，必须在解码前
+	// 单独识别；仅裁掉 JSON 规范允许的空白（空格、制表符、换行、回车）。
+	if bytes.Equal(bytes.Trim(raw, " \t\n\r"), []byte("null")) {
+		return nil, nil, errors.New("房间数据格式错误：房间数据必须是数组，不能是 null")
 	}
 	var records []json.RawMessage
 	if err := json.Unmarshal(raw, &records); err != nil {
