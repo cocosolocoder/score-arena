@@ -313,15 +313,167 @@ test('混合记录：房间对象全部按相对次序展示，非对象记录�
     'mix-partial', '缺字段五子棋', '五子棋', '2 人', 'undefined 秒', '', '',
   ], '缺字段对象的单元格应沿用现有兜底显示');
   assert.equal(rows[3].badge, '');
-  // 现有兜底：缺 createdAt 时单元格文本为空，title 属性被 DOM 序列化为 "undefined"。
-  assert.equal(rows[3].timeTitle, 'undefined');
+  // 缺 createdAt 时单元格保持空白，且没有任何悬浮说明（不存在 title 属性）。
+  assert.equal(rows[3].timeTitle, null);
 
   // R5：空对象也是对象，同样成行且不计跳过，各单元格走兜底。
   assert.deepEqual(rows[4].cells, [
     '', '', '', ' 人', 'undefined 秒', '', '',
   ], '空对象应作为房间行并沿用现有兜底显示');
   assert.equal(rows[4].badge, '');
-  assert.equal(rows[4].timeTitle, 'undefined');
+  assert.equal(rows[4].timeTitle, null);
+});
+
+// 创建时间一列的三种展示必须互不混淆：
+//   - 能解析的字符串按浏览器本地时区显示 YYYY-MM-DD HH:mm:ss（带偏移量的按
+//     实际时刻换算到本地），悬浮说明保留接口返回的原始字符串；
+//   - 非空但无法解析的字符串逐字按原文显示，不替换成当前时间或 Invalid Date，
+//     也不附悬浮说明；原文含尖括号/引号/与号/实体样式文字时只作为文字；
+//   - 字段缺失、null、空字符串时单元格空白且没有悬浮说明；
+//   - 对象/数组仍统一显示“字段格式异常”，不展开、不附悬浮说明。
+// 任何一种情况都不影响房间成行、行序与整份表格。
+const T_OK_Z = '2026-02-03T08:30:00Z';
+const T_OK_OFFSET = '2026-03-04T08:30:00+05:30';
+const T_PENDING = '日期待补';
+const T_TAGS = '<b>留待补录</b> &amp; "时间"';
+
+const TIME_RECORDS = [
+  { id: 'time-ok-z', name: 'UTC 时刻房', game: 'gomoku', capacity: 2, turnSeconds: 0,
+    status: 'waiting', createdAt: T_OK_Z },
+  { id: 'time-ok-offset', name: '带偏移时刻房', game: 'ludo', capacity: 3, turnSeconds: 60,
+    status: 'waiting', createdAt: T_OK_OFFSET },
+  { id: 'time-pending', name: '日期待补房', game: 'gomoku', capacity: 2, turnSeconds: 0,
+    status: 'waiting', createdAt: T_PENDING },
+  { id: 'time-tags', name: '标签样式原文房', game: 'ludo', capacity: 4, turnSeconds: 300,
+    status: 'playing', createdAt: T_TAGS },
+  { id: 'time-null', name: 'null 时间房', game: 'gomoku', capacity: 2, turnSeconds: 0,
+    status: 'waiting', createdAt: null },
+  { id: 'time-empty', name: '空串时间房', game: 'gomoku', capacity: 2, turnSeconds: 0,
+    status: 'waiting', createdAt: '' },
+  { id: 'time-missing', name: '缺字段时间房', game: 'ludo', capacity: 3, turnSeconds: 10,
+    status: 'waiting' },
+  { id: 'time-arr', name: '数组时间房', game: 'gomoku', capacity: 2, turnSeconds: 0,
+    status: 'waiting', createdAt: [T_OK_Z] },
+  { id: 'time-obj', name: '对象时间房', game: 'gomoku', capacity: 2, turnSeconds: 0,
+    status: 'waiting', createdAt: { v: T_OK_Z } },
+];
+
+// 与页面同一浏览器时区下，独立按“解析时刻 → 本地分量”算出期望文本，
+// 并校验把文本按本地时间解析回得到同一时刻（带偏移量的字符串不能把原串
+// 里的时分直接当本地时间）。
+function expectedLocalText(page, raw) {
+  return page.evaluate((s) => {
+    const d = new Date(s);
+    const pad = (n) => String(n).padStart(2, '0');
+    const text = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+    // 页面文本按本地时间解析回的时刻必须等于原字符串表示的时刻。
+    const reparsed = new Date(text.replace(' ', 'T')).getTime();
+    return { text, sameInstant: reparsed === d.getTime() };
+  }, raw);
+}
+
+test('创建时间：有效日期本地化显示并保留原文悬浮，无效原文逐字显示，缺失留空，异常字段照旧', { timeout: 60000 }, async (t) => {
+  const { page } = await setupMixedPage(t, TIME_RECORDS.map(JSON.stringify));
+
+  await waitForRowCount(page, TIME_RECORDS.length);
+  // 给页面足够时间，确认不会迟来跳过提示或加载失败。
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const list = await readListArea(page);
+  assert.equal(list.hasTable, true, '无论创建时间能否解析都应照常显示房间表格');
+  assert.equal(list.rowCount, TIME_RECORDS.length, '九种创建时间情况各占一行');
+  assert.equal(list.errorText, null, '创建时间无法解析不是列表加载失败');
+  assert.equal(list.skipText, null, '创建时间异常的对象不计入跳过');
+  assert.ok(!list.text.includes('Invalid Date'), '页面不应生成 Invalid Date 字样');
+
+  const rows = await readRows(page);
+  assert.deepEqual(
+    rows.map((r) => r.cells[0]),
+    TIME_RECORDS.map((r) => r.id),
+    '行的相对次序与接口一致',
+  );
+
+  // 1) 有效日期：本地格式化文本 + 原始字符串悬浮说明。
+  for (const [i, raw] of [T_OK_Z, T_OK_OFFSET].entries()) {
+    assert.match(rows[i].cells[6], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/,
+      '可解析时间应显示为 YYYY-MM-DD HH:mm:ss');
+    assert.equal(rows[i].timeTitle, raw, '悬浮说明应为接口返回的原始时间字符串');
+    const expected = await expectedLocalText(page, raw);
+    assert.equal(rows[i].cells[6], expected.text,
+      '带时区信息的时间应显示其实际对应的本地时刻');
+    assert.ok(expected.sameInstant, '展示文本按本地时区应对应原字符串的同一时刻');
+  }
+
+  // 2) 非空但无法解析的字符串：逐字原文显示，不附悬浮说明。
+  assert.equal(rows[2].cells[6], T_PENDING, '“日期待补”应逐字显示在单元格中');
+  assert.equal(rows[2].timeTitle, null, '无法解析的原文不应附带日期悬浮说明');
+  assert.equal(rows[3].cells[6], T_TAGS, '含尖括号/与号/引号的原文应逐字显示');
+  assert.equal(rows[3].timeTitle, null);
+
+  // 标签样式文字必须只作为文字：不产生子元素，innerHTML 为转义写法。
+  const tagCell = await page.$$eval('#list-area table tbody tr', (trs) => {
+    const td = trs[3].querySelectorAll('td')[6];
+    return { innerHTML: td.innerHTML, children: td.childElementCount };
+  });
+  assert.equal(tagCell.children, 0, '原文中的标签文字不能变成网页元素');
+  assert.ok(tagCell.innerHTML.includes('&lt;b&gt;'), '尖括号应被转义为文字');
+  assert.ok(tagCell.innerHTML.includes('&amp;amp;'),
+    '与号应被转义为文字，类似字符实体的写法不再被解释');
+  for (const tag of ['b', 'script', 'img', 'a']) {
+    assert.equal(
+      await page.$$eval('#list-area ' + tag, (els) => els.length),
+      0,
+      '创建时间原文不能产生 ' + tag + ' 元素',
+    );
+  }
+
+  // 3) 缺失 / null / 空字符串：单元格空白且没有任何悬浮说明。
+  for (const i of [4, 5, 6]) {
+    assert.equal(rows[i].cells[6], '', '无创建时间的单元格应保持空白');
+    assert.equal(rows[i].timeTitle, null, '无创建时间时不应存在 title 属性');
+  }
+
+  // 4) 对象/数组：沿用既有异常处理，只显示“字段格式异常”且无悬浮说明。
+  for (const i of [7, 8]) {
+    assert.equal(rows[i].cells[6], BAD_FIELD_TEXT);
+    assert.equal(rows[i].timeTitle, null, '异常创建时间不应附带日期悬浮说明');
+  }
+
+  // 其他列不受影响（抽查首尾两行）。
+  assert.equal(rows[0].cells[1], 'UTC 时刻房');
+  assert.equal(rows[8].cells[0], 'time-obj');
+  assert.equal(rows[8].badge, '未开始');
+});
+
+// 即使所有房间的创建时间都无法解析或缺失，房间表格也照常显示：
+// 不显示加载失败、不计跳过、不出空列表提示，各行原文/空白各自明确。
+test('所有创建时间都无法解析：照常显示房间表格与全部行，不算跳过、不算加载失败', { timeout: 60000 }, async (t) => {
+  const records = [
+    { id: 'all-bad-time-1', name: '房甲', game: 'gomoku', capacity: 2, turnSeconds: 0,
+      status: 'waiting', createdAt: '日期待补' },
+    { id: 'all-bad-time-2', name: '房乙', game: 'ludo', capacity: 4, turnSeconds: 30,
+      status: 'playing', createdAt: '<span>not a date</span>' },
+    { id: 'all-bad-time-3', name: '房丙', game: 'gomoku', capacity: 2, turnSeconds: 0,
+      status: 'waiting' },
+  ];
+  const { page } = await setupMixedPage(t, records.map(JSON.stringify));
+
+  await waitForRowCount(page, 3);
+  const list = await readListArea(page);
+  assert.equal(list.hasTable, true);
+  assert.equal(list.rowCount, 3);
+  assert.equal(list.errorText, null);
+  assert.equal(list.skipText, null);
+  assert.deepEqual(list.emptyTexts, []);
+  assert.ok(!list.text.includes('Invalid Date'));
+
+  const rows = await readRows(page);
+  assert.equal(rows[0].cells[6], '日期待补');
+  assert.equal(rows[0].timeTitle, null);
+  assert.equal(rows[1].cells[6], '<span>not a date</span>');
+  assert.equal(rows[1].timeTitle, null);
+  assert.equal(rows[2].cells[6], '');
+  assert.equal(rows[2].timeTitle, null);
 });
 
 // 数组非空但所有元素都是非对象（且刻意包含空串、0、false、空数组这些

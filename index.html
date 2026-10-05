@@ -228,13 +228,28 @@
     });
   }
 
-  function formatTime(iso) {
-    var d = new Date(iso);
-    if (isNaN(d.getTime())) return iso;
-    var pad = function (n) { return String(n).padStart(2, '0'); };
-    var text = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
-      ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
-    return { text: text, title: iso };
+  // 创建时间的三种展示互斥：
+  //   1. 字段缺失、值为 null 或空字符串：单元格保持空白，且没有悬浮说明；
+  //   2. 能解析成有效日期：按浏览器本地时区显示 YYYY-MM-DD HH:mm:ss，月日时分秒
+  //      补足两位；带时区偏移的字符串按其实际时刻换算到本地，而不是把原串里的
+  //      时分直接当本地时间；悬浮说明保留接口返回的原始时间字符串；
+  //   3. 非空但无法解析的字符串：逐字按原文显示，不删字符、不替换成当前时间，
+  //      也不附加日期悬浮说明（由调用方以 textContent 赋值，尖括号等只作文字）。
+  // 返回 null 表示“留空且无说明”；对象/数组等异常字段在到达这里之前已由
+  // isAbnormalField 拦下，本函数只处理原始值（字符串、数字、布尔值等）。
+  function formatTime(value) {
+    if (value === null || value === undefined) return null;
+    var raw = String(value);
+    if (raw === '') return null;
+    var d = new Date(value);
+    if (!isNaN(d.getTime())) {
+      var pad = function (n) { return String(n).padStart(2, '0'); };
+      var text = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+        ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+      return { text: text, title: raw };
+    }
+    // 无法解析的非空值：原文作为普通文本返回，不带任何悬浮说明。
+    return { text: raw };
   }
 
   // 只有 JSON 对象能作为房间行；null、字符串、数字、布尔值和数组都跳过。
@@ -326,9 +341,14 @@
       key: 'createdAt',
       label: '创建时间',
       render: function (td, value) {
-        var t = formatTime(value || '');
+        var t = formatTime(value);
+        if (t === null) return; // 缺失/null/空串：留空且不设置 title。
+        // 统一以 textContent 赋值：原文即使含尖括号、引号、与号或类似标签、
+        // 字符实体的文字，也只作为文字呈现，不会变成网页元素。
         td.textContent = t.text;
-        td.title = t.title;
+        // 只有有效日期才附带原始时间字符串的悬浮说明；无法解析的原文
+        // （t.title 缺省）不附加任何日期悬浮说明。
+        if (t.title !== undefined) td.title = t.title;
       }
       // 无 renderBad：异常创建时间只显示异常文案，不附加日期悬浮说明
       // （不设置 title）。
