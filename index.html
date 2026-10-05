@@ -149,18 +149,40 @@
     return value.replace(LEADING_SPACE, '').replace(TRAILING_SPACE, '');
   }
 
-  // 与服务端一致的提交前校验；服务端仍会再次校验。
-  function validate(payload) {
-    var nameLen = Array.from(trimName(payload.name)).length;
-    if (nameLen === 0) return '房间名称不能为空。';
-    if (nameLen > 40) return '房间名称去掉首尾空白后不能超过 40 个字符。';
-    if (payload.game !== 'gomoku' && payload.game !== 'ludo') return '请选择游戏规则。';
-    if (payload.game === 'gomoku' && payload.capacity !== 2) return '五子棋的人数上限固定为 2 人。';
-    if (payload.game === 'ludo' && !(payload.capacity >= 2 && payload.capacity <= 4)) {
+  // 与服务端一致的提交前校验，整理与转换都只做一次、集中在这一处；
+  // 服务端仍会独立再次校验，不依赖页面已经判断过。
+  // 顺序沿用既有提示的先后：
+  //   1. 必填检查——名称（整理后为空也算未填）、规则、人数、时间，多项同时
+  //      缺失时只提示这个顺序中的第一个，一律不补默认值；
+  //   2. 写法检查——时间文本必须是十进制整数字面量，小数、科学计数法等沿用
+  //      整数秒提示，非法文字不会被转换成有效秒数；
+  //   3. 配置检查——名称按去掉首尾空白后的 Unicode 码点计长、人数按所选规则
+  //      联动判断、时间只允许 0（不限时）或 10 至 600 的整数，空值不会先变 0。
+  function validateCreate(fields) {
+    var trimmedName = trimName(fields.nameRaw);
+    if (trimmedName === '') return '房间名称不能为空。';
+    if (fields.game !== 'gomoku' && fields.game !== 'ludo') return '请选择游戏规则。';
+    if (fields.capacity === null) return '请选择人数上限。';
+    var turnRaw = fields.turnRaw;
+    if (turnRaw === '') return '请填写每步时间限制（0 表示不限时）。';
+
+    if (!/^-?\d+$/.test(turnRaw)) return '时间限制必须是整数秒，不能含小数。';
+
+    // 名称只整理这一次：长度按码点计，内部空白与表情保留，
+    // U+FEFF 不在 trimName 的去除范围内，仍计入长度。
+    if (Array.from(trimmedName).length > 40) {
+      return '房间名称去掉首尾空白后不能超过 40 个字符。';
+    }
+    if (fields.game === 'gomoku' && fields.capacity !== 2) {
+      return '五子棋的人数上限固定为 2 人。';
+    }
+    if (fields.game === 'ludo' && !(fields.capacity >= 2 && fields.capacity <= 4)) {
       return '飞行棋的人数上限必须为 2 至 4 人。';
     }
-    var t = payload.turnSeconds;
-    if (t !== 0 && !(Number.isInteger(t) && t >= 10 && t <= 600)) {
+    // 时间文本只在此处转换成秒数：走到这里必为整数字面量，空值与非法文字
+    // 都已在前面返回，不会被当成 0 或其他有效秒数。
+    var seconds = Number(turnRaw);
+    if (seconds !== 0 && !(seconds >= 10 && seconds <= 600)) {
       return '每步时间限制只能填 0（不限时）或 10 至 600 之间的整数秒。';
     }
     return null;
@@ -173,30 +195,27 @@
     var nameInput = document.getElementById('name');
     var turnInput = document.getElementById('turnSeconds');
     var turnRaw = turnInput.value.trim();
-    var payload = {
-      name: nameInput.value,
+
+    // 校验期间只读控件、绝不改写：输入框保留用户填写原貌，名称携带原始输入，
+    // 漏填不补默认值；被拒提交在此返回，不会构造或发送创建请求。
+    var problem = validateCreate({
+      nameRaw: nameInput.value,
       game: gameSel.value,
       capacity: capSel.value === '' ? null : parseInt(capSel.value, 10),
-      turnSeconds: turnRaw === '' ? null : Number(turnRaw)
-    };
+      turnRaw: turnRaw
+    });
+    if (problem) {
+      showMessage('error', problem);
+      return;
+    }
 
-    // 漏填要明确报错，绝不补默认值；名称只含会被去掉的首尾空白时同样视为空。
-    if (trimName(payload.name) === '') return showMessage('error', '房间名称不能为空。'), false;
-    if (!payload.game) return showMessage('error', '请选择游戏规则。'), false;
-    if (payload.capacity === null) return showMessage('error', '请选择人数上限。'), false;
-    if (turnRaw === '') return showMessage('error', '请填写每步时间限制（0 表示不限时）。'), false;
-    if (!/^-?\d+$/.test(turnRaw)) return showMessage('error', '时间限制必须是整数秒，不能含小数。'), false;
-
-    var problem = validate({
-      name: payload.name,
-      game: payload.game,
-      capacity: payload.capacity,
+    // 合法提交沿用既有字段与类型：名称仍提交原始输入，时间只转换这一次。
+    submit({
+      name: nameInput.value,
+      game: gameSel.value,
+      capacity: parseInt(capSel.value, 10),
       turnSeconds: Number(turnRaw)
     });
-    if (problem) { showMessage('error', problem); return; }
-
-    payload.turnSeconds = Number(turnRaw);
-    submit(payload);
   });
 
   function submit(payload) {
