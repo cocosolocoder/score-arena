@@ -940,6 +940,249 @@ func TestCreateRoomRejectsMissingOrNonIntegerCapacity(t *testing.T) {
 	}
 }
 
+// 每步时间限制的合法取值：0 表示不限时，10 至 600 的整数（含两个端点）照常接受。
+// 五子棋与飞行棋遵循同一时间规则，人数按各自规则填写。合法请求返回 201，
+// 创建响应、房间列表与本地保存记录里的时间数值必须与提交值一致；
+// 0 必须作为明确的配置保存（字段存在且为 0），不能被当成没填；
+// 名称、规则和人数也不能因为时间处理而改变。
+func TestCreateRoomTurnSecondsValidValues(t *testing.T) {
+	dataDir := t.TempDir()
+	seed := seedRooms(t, dataDir, seedRecord1, seedRecord2)
+	baseURL := startServer(t, dataDir)
+
+	cases := []struct {
+		name     string
+		game     string
+		capacity int
+		turn     int
+	}{
+		{"五子棋不限时", "gomoku", 2, 0},
+		{"五子棋十秒", "gomoku", 2, 10},
+		{"五子棋六百秒", "gomoku", 2, 600},
+		{"五子棋四十五秒", "gomoku", 2, 45},
+		{"飞行棋不限时", "ludo", 3, 0},
+		{"飞行棋十秒", "ludo", 2, 10},
+		{"飞行棋六百秒", "ludo", 4, 600},
+		{"飞行棋五百九十九秒", "ludo", 4, 599},
+	}
+
+	createdRooms := make([]map[string]any, 0, len(cases))
+	for _, tc := range cases {
+		body, _ := json.Marshal(map[string]any{
+			"name": "  " + tc.name + "  ", "game": tc.game,
+			"capacity": tc.capacity, "turnSeconds": tc.turn,
+		})
+		status, created := postRoom(t, baseURL, string(body))
+		if status != http.StatusCreated {
+			t.Fatalf("%s turnSeconds=%d 创建状态码 = %d，期望 201，响应: %v", tc.game, tc.turn, status, created)
+		}
+		if id, _ := created["id"].(string); id == "" {
+			t.Fatalf("%s turnSeconds=%d 的新房间编号为空", tc.game, tc.turn)
+		}
+		if got := created["turnSeconds"]; got != float64(tc.turn) {
+			t.Fatalf("创建响应的每步时间 = %v，期望 %d（按提交值保存，含明确的 0）", got, tc.turn)
+		}
+		// 时间处理不得改变其余配置。
+		if got := created["name"]; got != tc.name {
+			t.Fatalf("名称 = %v，期望 %q（仍按现有方式去掉首尾空白）", got, tc.name)
+		}
+		if got := created["game"]; got != tc.game {
+			t.Fatalf("规则 = %v，期望 %q", got, tc.game)
+		}
+		if got := created["capacity"]; got != float64(tc.capacity) {
+			t.Fatalf("人数 = %v，期望 %d", got, tc.capacity)
+		}
+		if got := created["status"]; got != "waiting" {
+			t.Fatalf("状态 = %v，期望 waiting", got)
+		}
+		if got := created["visibility"]; got != "public" {
+			t.Fatalf("公开范围 = %v，期望 public", got)
+		}
+		createdRooms = append(createdRooms, created)
+	}
+
+	// 房间列表：原有 2 条之后按创建次序追加，每条与创建响应一致。
+	listStatus, rooms := getRooms(t, baseURL)
+	if listStatus != http.StatusOK {
+		t.Fatalf("GET /api/rooms 状态码 = %d，期望 200", listStatus)
+	}
+	if len(rooms) != 2+len(cases) {
+		t.Fatalf("房间数量 = %d，期望 %d（原有 2 条 + 新增 %d 条）", len(rooms), 2+len(cases), len(cases))
+	}
+	if want := decodeRecords(t, seed); !reflect.DeepEqual(rooms[:2], want) {
+		t.Fatalf("原有房间被改写或重新排序：\n得到: %v\n期望: %v", rooms[:2], want)
+	}
+	for i, created := range createdRooms {
+		if !reflect.DeepEqual(rooms[2+i], created) {
+			t.Fatalf("列表第 %d 条新记录与创建响应不一致：\n列表: %v\n响应: %v", i+1, rooms[2+i], created)
+		}
+	}
+
+	// 本地保存记录：与列表一致，且每个新房间的 turnSeconds 字段都明确存在、
+	// 数值等于提交值——0 也必须落盘为 0，不能缺省或被改成默认时间。
+	saved := decodeRecords(t, readDataFile(t, dataDir))
+	if !reflect.DeepEqual(saved, rooms) {
+		t.Fatalf("本地保存记录与房间列表不一致：\n文件: %v\n列表: %v", saved, rooms)
+	}
+	for i, tc := range cases {
+		record, ok := saved[2+i].(map[string]any)
+		if !ok {
+			t.Fatalf("保存的第 %d 条新记录不是对象: %v", i+1, saved[2+i])
+		}
+		got, present := record["turnSeconds"]
+		if !present {
+			t.Fatalf("%s turnSeconds=%d 的保存记录缺少 turnSeconds 字段（0 也必须明确保存）", tc.game, tc.turn)
+		}
+		if got != float64(tc.turn) {
+			t.Fatalf("保存的每步时间 = %v，期望 %d", got, tc.turn)
+		}
+	}
+}
+
+// 每步时间以非整数形式提供时必须拒绝：null、字符串、布尔值、对象、数组，
+// 以及带小数点的 30.0（数值虽为整数）和科学计数法 3e1，都按非整数写法拒绝，
+// 不能取整或转换后创建。返回 400 且 error 说明 turnSeconds 必须是整数，
+// 而不是缺少字段；不返回成功房间，已有记录与本地文件保持原样。
+// 请求中的名称、规则和人数均合法，失败原因只能落在时间配置上。
+func TestCreateRoomRejectsNonIntegerTurnSeconds(t *testing.T) {
+	dataDir := t.TempDir()
+	seed := seedRooms(t, dataDir, seedRecord1, seedRecord2)
+	baseURL := startServer(t, dataDir)
+
+	cases := []struct {
+		desc string
+		body string
+	}{
+		{"时间为 null", `{"name":"null 时间房","game":"gomoku","capacity":2,"turnSeconds":null}`},
+		{"时间为字符串", `{"name":"字符串时间房","game":"gomoku","capacity":2,"turnSeconds":"30"}`},
+		{"时间为布尔值", `{"name":"布尔时间房","game":"ludo","capacity":3,"turnSeconds":true}`},
+		{"时间为对象", `{"name":"对象时间房","game":"ludo","capacity":4,"turnSeconds":{"seconds":30}}`},
+		{"时间为数组", `{"name":"数组时间房","game":"gomoku","capacity":2,"turnSeconds":[30]}`},
+		{"时间为带小数点的整数值 30.0", `{"name":"小数点时间房","game":"gomoku","capacity":2,"turnSeconds":30.0}`},
+		{"时间为科学计数法 3e1", `{"name":"科学计数时间房","game":"ludo","capacity":2,"turnSeconds":3e1}`},
+	}
+
+	for _, tc := range cases {
+		status, rejected := postRoom(t, baseURL, tc.body)
+		if status != http.StatusBadRequest {
+			t.Fatalf("%s：状态码 = %d，期望 400，响应: %v", tc.desc, status, rejected)
+		}
+		errMsg, _ := rejected["error"].(string)
+		if !strings.Contains(errMsg, "turnSeconds") || !strings.Contains(errMsg, "整数") {
+			t.Fatalf("%s：error 应说明 turnSeconds 必须是整数，实际: %q", tc.desc, errMsg)
+		}
+		if strings.Contains(errMsg, "缺少") {
+			t.Fatalf("%s：字段已提供但类型不符，error 不应说成缺少字段，实际: %q", tc.desc, errMsg)
+		}
+		// 名称、规则与人数均合法，错误原因只能落在时间字段上。
+		if strings.Contains(errMsg, "名称") || strings.Contains(errMsg, "capacity") || strings.Contains(errMsg, "game") {
+			t.Fatalf("%s：其余配置均合法，error 不应落在无关字段上，实际: %q", tc.desc, errMsg)
+		}
+		if _, ok := rejected["id"]; ok {
+			t.Fatalf("%s：被拒绝的请求不应返回房间编号，实际: %v", tc.desc, rejected)
+		}
+	}
+
+	// 缺少字段与类型不符要能区分：未提供 turnSeconds 报“缺少必填字段”，不含“整数”。
+	missingStatus, missingBody := postRoom(t, baseURL, `{"name":"复验缺时间","game":"gomoku","capacity":2}`)
+	if missingStatus != http.StatusBadRequest {
+		t.Fatalf("缺时间复验状态码 = %d，期望 400，响应: %v", missingStatus, missingBody)
+	}
+	missingErr, _ := missingBody["error"].(string)
+	if !strings.Contains(missingErr, "缺少必填字段") || !strings.Contains(missingErr, "turnSeconds") {
+		t.Fatalf("缺少 turnSeconds 应报“缺少必填字段：turnSeconds”，实际: %q", missingErr)
+	}
+	if strings.Contains(missingErr, "整数") {
+		t.Fatalf("缺少时间字段不应报“必须是整数”，实际: %q", missingErr)
+	}
+
+	// 全部拒绝后：已有房间数量、次序、内容与附带字段不变，本地文件逐字节保留。
+	assertRoomsUnchanged(t, baseURL, dataDir, seed)
+}
+
+// 整数但越界的每步时间必须拒绝：-1、1、9 和 601 属于范围错误，
+// 返回 400（不是 500 服务内部故障），error 说明允许 0（不限时）或 10 至 600 秒；
+// 不返回成功房间，已有记录与本地文件保持原样。只把时间改为合法整数、
+// 保留其余配置再提交时应正常创建，新房间按修正后的秒数追加，被拒的时间不留记录。
+func TestCreateRoomRejectsOutOfRangeTurnSeconds(t *testing.T) {
+	dataDir := t.TempDir()
+	seed := seedRooms(t, dataDir, seedRecord1, seedRecord2)
+	baseURL := startServer(t, dataDir)
+
+	outOfRange := []int{-1, 1, 9, 601}
+	for _, turn := range outOfRange {
+		body, _ := json.Marshal(map[string]any{
+			"name": "越界时间房", "game": "ludo", "capacity": 3, "turnSeconds": turn,
+		})
+		status, rejected := postRoom(t, baseURL, string(body))
+		if status != http.StatusBadRequest {
+			t.Fatalf("turnSeconds=%d：状态码 = %d，期望 400（不得返回成功或 500），响应: %v", turn, status, rejected)
+		}
+		errMsg, _ := rejected["error"].(string)
+		for _, part := range []string{"0", "10", "600"} {
+			if !strings.Contains(errMsg, part) {
+				t.Fatalf("turnSeconds=%d：error 应包含 %q 以说明允许 0 或 10 至 600 秒，实际: %q", turn, part, errMsg)
+			}
+		}
+		// 名称、规则与人数均合法，错误原因只能落在时间范围上。
+		if strings.Contains(errMsg, "名称") || strings.Contains(errMsg, "capacity") {
+			t.Fatalf("turnSeconds=%d：其余配置均合法，error 不应落在无关字段上，实际: %q", turn, errMsg)
+		}
+		if _, ok := rejected["id"]; ok {
+			t.Fatalf("turnSeconds=%d：被拒绝的请求不应返回房间编号，实际: %v", turn, rejected)
+		}
+	}
+
+	// 全部拒绝后：已有房间数量、次序、内容与附带字段不变，本地文件逐字节保留。
+	assertRoomsUnchanged(t, baseURL, dataDir, seed)
+
+	// 只把时间改成合法整数、其余配置原样保留再提交，应正常创建。
+	const fixedTurn = 30
+	body, _ := json.Marshal(map[string]any{
+		"name": "越界时间房", "game": "ludo", "capacity": 3, "turnSeconds": fixedTurn,
+	})
+	status, created := postRoom(t, baseURL, string(body))
+	if status != http.StatusCreated {
+		t.Fatalf("修正时间后创建状态码 = %d，期望 201，响应: %v", status, created)
+	}
+	if got := created["turnSeconds"]; got != float64(fixedTurn) {
+		t.Fatalf("修正后保存的每步时间 = %v，期望 %d", got, fixedTurn)
+	}
+	if got := created["name"]; got != "越界时间房" {
+		t.Fatalf("修正后名称 = %v，期望沿用原名称", got)
+	}
+	if got := created["game"]; got != "ludo" {
+		t.Fatalf("修正后规则 = %v，期望沿用 ludo", got)
+	}
+	if got := created["capacity"]; got != float64(3) {
+		t.Fatalf("修正后人数 = %v，期望沿用 3", got)
+	}
+
+	// 新房间按修正后的秒数追加在最后；曾被拒的时间不留下任何记录。
+	_, rooms := getRooms(t, baseURL)
+	if len(rooms) != 3 {
+		t.Fatalf("房间数量 = %d，期望 3（种子 2 条 + 修正后 1 条，被拒时间不得留记录）", len(rooms))
+	}
+	if want := decodeRecords(t, seed); !reflect.DeepEqual(rooms[:2], want) {
+		t.Fatalf("原有房间被改动：\n得到: %v\n期望: %v", rooms[:2], want)
+	}
+	last, ok := rooms[2].(map[string]any)
+	if !ok {
+		t.Fatalf("新记录不是对象: %v", rooms[2])
+	}
+	if !reflect.DeepEqual(last, created) {
+		t.Fatalf("列表中的新记录与创建响应不一致：\n列表: %v\n响应: %v", last, created)
+	}
+	for _, record := range rooms {
+		room, _ := record.(map[string]any)
+		if room["name"] == "越界时间房" {
+			if got := room["turnSeconds"]; got != float64(fixedTurn) {
+				t.Fatalf("列表中出现曾被拒绝的时间 %v，说明越界值被保存或留了记录", got)
+			}
+		}
+	}
+}
+
 // 只含会被去掉的首尾空白（含 U+0085、U+00A0）的名称视为空，
 // 返回 400 并说明名称不能为空，不返回新房间编号，已有数据保持不变。
 func TestCreateRoomRejectedWhenNameOnlyWhitespace(t *testing.T) {
