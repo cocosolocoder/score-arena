@@ -313,15 +313,15 @@ test('混合记录：房间对象全部按相对次序展示，非对象记录�
     'mix-partial', '缺字段五子棋', '五子棋', '2 人', 'undefined 秒', '', '',
   ], '缺字段对象的单元格应沿用现有兜底显示');
   assert.equal(rows[3].badge, '');
-  // 现有兜底：缺 createdAt 时单元格文本为空，title 属性被 DOM 序列化为 "undefined"。
-  assert.equal(rows[3].timeTitle, 'undefined');
+  // 缺 createdAt 时单元格留空，且不附任何悬浮说明（不生成 undefined）。
+  assert.equal(rows[3].timeTitle, null, '缺少创建时间不应附带悬浮说明');
 
   // R5：空对象也是对象，同样成行且不计跳过，各单元格走兜底。
   assert.deepEqual(rows[4].cells, [
     '', '', '', ' 人', 'undefined 秒', '', '',
   ], '空对象应作为房间行并沿用现有兜底显示');
   assert.equal(rows[4].badge, '');
-  assert.equal(rows[4].timeTitle, 'undefined');
+  assert.equal(rows[4].timeTitle, null, '缺少创建时间不应附带悬浮说明');
 });
 
 // 数组非空但所有元素都是非对象（且刻意包含空串、0、false、空数组这些

@@ -228,13 +228,28 @@
     });
   }
 
-  function formatTime(iso) {
-    var d = new Date(iso);
-    if (isNaN(d.getTime())) return iso;
+  // 创建时间列的三种正常展示（对象/数组已由 buildRoomRow 统一判为异常，
+  // 不会进入这里）：
+  //   1. 能解析成有效日期的字符串：按浏览器本地时区显示
+  //      YYYY-MM-DD HH:mm:ss（带时区偏移的时间换算成实际对应的本地时刻，
+  //      不把原串里的时分当本地时间），悬浮提示保留接口返回的原始字符串；
+  //   2. 无法解析的非空字符串：原文直接显示在单元格中（textContent 保证
+  //      尖括号等字符只作为文字呈现），不替换为当前时间，不附悬浮说明；
+  //   3. 字段缺失、null 或空字符串：单元格留空且没有悬浮说明，
+  //      绝不由页面生成 undefined 或 Invalid Date。
+  function renderTimeCell(td, value) {
+    if (value == null || value === '') return;
+
+    var d = new Date(value);
+    if (isNaN(d.getTime())) {
+      td.textContent = typeof value === 'string' ? value : String(value);
+      return;
+    }
+
     var pad = function (n) { return String(n).padStart(2, '0'); };
-    var text = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+    td.textContent = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
       ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
-    return { text: text, title: iso };
+    td.title = typeof value === 'string' ? value : String(value);
   }
 
   // 只有 JSON 对象能作为房间行；null、字符串、数字、布尔值和数组都跳过。
@@ -325,11 +340,7 @@
     {
       key: 'createdAt',
       label: '创建时间',
-      render: function (td, value) {
-        var t = formatTime(value || '');
-        td.textContent = t.text;
-        td.title = t.title;
-      }
+      render: renderTimeCell
       // 无 renderBad：异常创建时间只显示异常文案，不附加日期悬浮说明
       // （不设置 title）。
     }
