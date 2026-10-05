@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -82,6 +83,77 @@ func startServer(t *testing.T, dataDir string) string {
 	case <-time.After(15 * time.Second):
 		t.Fatal("等待服务监听地址超时")
 		return ""
+	}
+}
+
+// managedServer 是一个可以被正常停止的服务子进程句柄。
+type managedServer struct {
+	cmd     *exec.Cmd
+	baseURL string
+}
+
+// startManagedServer 在 dataDir 上启动服务子进程，不注册 t.Cleanup 强杀，
+// 以便测试显式地走“正常停止（SIGTERM 优雅停机）→ 等待退出”的流程。
+func startManagedServer(t *testing.T, dataDir string) *managedServer {
+	t.Helper()
+	cmd := exec.Command(serverBin, "serve", "--host", "127.0.0.1", "--port", "0", "--data-dir", dataDir)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("获取服务输出失败: %v", err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("启动服务失败: %v", err)
+	}
+
+	lineCh := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if line := scanner.Text(); strings.Contains(line, "listening on") {
+				lineCh <- line
+				return
+			}
+		}
+		lineCh <- ""
+	}()
+
+	var baseURL string
+	select {
+	case line := <-lineCh:
+		if line == "" {
+			_ = cmd.Wait()
+			t.Fatal("服务在输出监听地址前退出")
+		}
+		idx := strings.Index(line, "http://")
+		if idx < 0 {
+			_ = cmd.Wait()
+			t.Fatalf("无法从服务输出解析地址: %q", line)
+		}
+		baseURL = strings.TrimSpace(line[idx:])
+	case <-time.After(15 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal("等待服务监听地址超时")
+	}
+	return &managedServer{cmd: cmd, baseURL: baseURL}
+}
+
+// stopGracefully 发送 SIGTERM 让服务走正常停机流程，并等待其退出，
+// 模拟题目要求的“正常停止服务”。若进程未在限时内退出则强制结束并使测试失败。
+func (s *managedServer) stopGracefully(t *testing.T) {
+	t.Helper()
+	if err := s.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("发送停止信号失败: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		_ = s.cmd.Process.Kill()
+		<-done
+		t.Fatal("服务在正常停止信号后未退出")
 	}
 }
 
@@ -1204,4 +1276,394 @@ func TestCreateRoomRejectedWhenNameOnlyWhitespace(t *testing.T) {
 	}
 
 	assertRoomsUnchanged(t, baseURL, dataDir, seed)
+}
+
+// 以下测试覆盖“正常停止服务后，用同一业务数据目录重新启动”的保留行为：
+// 服务子进程先接收 SIGTERM 走优雅停机，再以相同 --data-dir 拉起新进程，
+// 全程只通过公开 HTTP 接口与本地 rooms.json 观察结果。
+
+// assertFileByteStable 断言当前数据文件与给定快照逐字节一致，
+// 用于钉住“启动”和“只查询列表”都不得改写本地已有内容。
+func assertFileByteStable(t *testing.T, dataDir string, snapshot []byte, phase string) {
+	t.Helper()
+	if got := readDataFile(t, dataDir); !bytes.Equal(got, snapshot) {
+		t.Fatalf("%s后数据文件被改写：\n得到: %s\n期望: %s", phase, got, snapshot)
+	}
+}
+
+// 用户成功创建五子棋（不限时 0）和飞行棋（有限整数秒）房间后正常停止服务，
+// 使用同一数据目录重启：查询必须返回停止前的全部记录，数量、排列次序、编号一致，
+// 名称、规则、人数、每步时间、状态、公开范围、创建时间均为原值；
+// 0 不能被补成默认秒数，两个房间的配置不能相互串用；
+// 名称以创建时去首尾空白的结果为准，内部空格与表情保留。
+// 启动与只查询列表都不得改写本地文件；重启后再创建的房间只追加在旧记录之后，
+// 新编号非空且不同于全部已有编号，旧记录内容与相对顺序不变。
+func TestRoomsPreservedAcrossGracefulRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	server := startManagedServer(t, dataDir)
+
+	// 房间一：五子棋 + 不限时；名称首尾带空白，内部空格与表情必须保留。
+	status1, created1 := postRoom(t, server.baseURL, `{"name":"  深夜 😀 五子棋 房  ","game":"gomoku","capacity":2,"turnSeconds":0}`)
+	if status1 != http.StatusCreated {
+		t.Fatalf("五子棋房间创建状态码 = %d，期望 201，响应: %v", status1, created1)
+	}
+	// 房间二：飞行棋 + 有限整数秒，人数与时间都不同于房间一。
+	status2, created2 := postRoom(t, server.baseURL, `{"name":" 周末 飞行棋 局 🎲 ","game":"ludo","capacity":3,"turnSeconds":45}`)
+	if status2 != http.StatusCreated {
+		t.Fatalf("飞行棋房间创建状态码 = %d，期望 201，响应: %v", status2, created2)
+	}
+
+	id1, _ := created1["id"].(string)
+	id2, _ := created2["id"].(string)
+	if id1 == "" || id2 == "" || id1 == id2 {
+		t.Fatalf("停止前两个房间编号应非空且互不相同，实际: %q, %q", id1, id2)
+	}
+
+	// 停止前的列表：两条记录按创建次序排列，与创建响应一致。
+	listStatus, beforeStop := getRooms(t, server.baseURL)
+	if listStatus != http.StatusOK || len(beforeStop) != 2 {
+		t.Fatalf("停止前列表状态码 = %d、数量 = %d，期望 200/2", listStatus, len(beforeStop))
+	}
+	if !reflect.DeepEqual(beforeStop[0], created1) || !reflect.DeepEqual(beforeStop[1], created2) {
+		t.Fatalf("停止前列表与创建响应不一致：\n%v\n%v", beforeStop, []any{created1, created2})
+	}
+
+	// 正常停止，并固化停止后的本地文件快照。
+	server.stopGracefully(t)
+	snapshot := readDataFile(t, dataDir)
+	if len(decodeRecords(t, snapshot)) != 2 {
+		t.Fatalf("停止后数据文件应有 2 条记录，实际: %s", snapshot)
+	}
+
+	// 使用同一业务数据目录重新启动。
+	restarted := startManagedServer(t, dataDir)
+
+	// 仅启动不应改写已有文件。
+	assertFileByteStable(t, dataDir, snapshot, "重新启动")
+
+	// 只查询列表不应改写本地文件。
+	getStatus, afterRestart := getRooms(t, restarted.baseURL)
+	if getStatus != http.StatusOK {
+		t.Fatalf("重启后 GET /api/rooms 状态码 = %d，期望 200", getStatus)
+	}
+	assertFileByteStable(t, dataDir, snapshot, "查询列表")
+
+	// 数量、排列次序、编号一致。
+	if len(afterRestart) != 2 {
+		t.Fatalf("重启后房间数量 = %d，期望 2（不能清空或只恢复部分）", len(afterRestart))
+	}
+	if !reflect.DeepEqual(afterRestart, beforeStop) {
+		t.Fatalf("重启后记录与停止前不一致（数量/次序/任一原值被改）：\n得到: %v\n期望: %v", afterRestart, beforeStop)
+	}
+
+	r1, _ := afterRestart[0].(map[string]any)
+	r2, _ := afterRestart[1].(map[string]any)
+	if r1["id"] != id1 || r2["id"] != id2 {
+		t.Fatalf("重启后编号/次序变化: %q, %q（期望 %q, %q）", r1["id"], r2["id"], id1, id2)
+	}
+	// 名称：以创建成功时去首尾空白的结果为准，内部空格与表情保留。
+	if got := r1["name"]; got != "深夜 😀 五子棋 房" {
+		t.Fatalf("房间一名称 = %v，期望 %q", got, "深夜 😀 五子棋 房")
+	}
+	if got := r2["name"]; got != "周末 飞行棋 局 🎲" {
+		t.Fatalf("房间二名称 = %v，期望 %q", got, "周末 飞行棋 局 🎲")
+	}
+	// 规则、人数、时间、状态、公开范围、创建时间逐项钉住原值，防止只恢复部分配置。
+	if r1["game"] != "gomoku" || r2["game"] != "ludo" {
+		t.Fatalf("规则未按原值保留: %v, %v", r1["game"], r2["game"])
+	}
+	if r1["capacity"] != float64(2) || r2["capacity"] != float64(3) {
+		t.Fatalf("人数未按原值保留: %v, %v（不能相互串用）", r1["capacity"], r2["capacity"])
+	}
+	if r1["turnSeconds"] != float64(0) {
+		t.Fatalf("不限时的 0 未被保留，实际 = %v（不能补成默认值）", r1["turnSeconds"])
+	}
+	if r2["turnSeconds"] != float64(45) {
+		t.Fatalf("有限整数秒未被保留，实际 = %v", r2["turnSeconds"])
+	}
+	if r1["status"] != "waiting" || r2["status"] != "waiting" {
+		t.Fatalf("状态未按原值保留: %v, %v", r1["status"], r2["status"])
+	}
+	if r1["visibility"] != "public" || r2["visibility"] != "public" {
+		t.Fatalf("公开范围未按原值保留: %v, %v", r1["visibility"], r2["visibility"])
+	}
+	if r1["createdAt"] != created1["createdAt"] || r2["createdAt"] != created2["createdAt"] {
+		t.Fatalf("创建时间被改动: %v, %v（期望 %v, %v）",
+			r1["createdAt"], r2["createdAt"], created1["createdAt"], created2["createdAt"])
+	}
+
+	// 重启后再成功创建一个房间：只能在原记录之后追加。
+	status3, created3 := postRoom(t, restarted.baseURL, `{"name":"重启后的新飞行棋","game":"ludo","capacity":4,"turnSeconds":600}`)
+	if status3 != http.StatusCreated {
+		t.Fatalf("重启后创建状态码 = %d，期望 201，响应: %v", status3, created3)
+	}
+	id3, _ := created3["id"].(string)
+	if id3 == "" {
+		t.Fatal("重启后新房间编号为空")
+	}
+	if id3 == id1 || id3 == id2 {
+		t.Fatalf("重启后新房间编号 %q 与已有编号重复", id3)
+	}
+
+	_, rooms := getRooms(t, restarted.baseURL)
+	if len(rooms) != 3 {
+		t.Fatalf("追加后房间数量 = %d，期望 3", len(rooms))
+	}
+	// 旧记录内容与相对顺序继续保持。
+	if !reflect.DeepEqual(rooms[:2], beforeStop) {
+		t.Fatalf("追加新房间后旧记录被改动：\n得到: %v\n期望: %v", rooms[:2], beforeStop)
+	}
+	// 查询到的新记录与这次创建返回的房间一致。
+	if !reflect.DeepEqual(rooms[2], created3) {
+		t.Fatalf("列表中的新记录与创建响应不一致：\n列表: %v\n响应: %v", rooms[2], created3)
+	}
+	// 本地落盘同样是“旧两条 + 新一条”。
+	saved := decodeRecords(t, readDataFile(t, dataDir))
+	if len(saved) != 3 || !reflect.DeepEqual(saved[:2], beforeStop) || !reflect.DeepEqual(saved[2], created3) {
+		t.Fatalf("落盘记录与预期（旧记录原位 + 新记录追加）不一致: %v", saved)
+	}
+
+	restarted.stopGracefully(t)
+}
+
+// 历史记录带有备注、数组、嵌套对象等附带字段，或缺少当前表单使用的字段时，
+// 正常停止并用同一目录重启后，必须按原内容全部返回：不能因字段不完整删除记录，
+// 不能丢附带字段，不能改次序。启动与只查询列表不改写本地文件；
+// 重启后合法创建的房间只追加，旧记录原位保留。
+func TestExtraAndPartialRecordsSurviveRestart(t *testing.T) {
+	dataDir := t.TempDir()
+
+	// 记录一：当前表单字段齐全，附带备注字符串、数组与嵌套对象。
+	recFull := `{"id":"restart-full","name":"老友备注房","game":"gomoku","capacity":2,"turnSeconds":0,"status":"waiting","visibility":"public","createdAt":"2026-03-03T03:03:03Z","note":"重启别丢我","tags":["周赛","😀"],"meta":{"board":{"size":15},"history":[1,2,3]}}`
+	// 记录二：历史遗留数据，缺少当前表单使用的 game/capacity/turnSeconds，
+	// 不能仅因字段不完整而删除。
+	recPartial := `{"id":"restart-legacy","name":"遗留房间","createdAt":"2026-02-02T02:02:02Z"}`
+	seed := seedRooms(t, dataDir, recFull, recPartial)
+
+	first := startManagedServer(t, dataDir)
+	assertFileByteStable(t, dataDir, seed, "首次启动")
+	status1, rooms1 := getRooms(t, first.baseURL)
+	if status1 != http.StatusOK {
+		t.Fatalf("首次查询状态码 = %d，期望 200", status1)
+	}
+	want := decodeRecords(t, seed)
+	if !reflect.DeepEqual(rooms1, want) {
+		t.Fatalf("首次查询未原样返回历史记录：\n得到: %v\n期望: %v", rooms1, want)
+	}
+	assertFileByteStable(t, dataDir, seed, "首次查询列表")
+	first.stopGracefully(t)
+
+	// 停止期间文件应保持原样，再用同一目录重启。
+	if got := readDataFile(t, dataDir); !bytes.Equal(got, seed) {
+		t.Fatalf("正常停止改写了数据文件：\n得到: %s", got)
+	}
+	restarted := startManagedServer(t, dataDir)
+	assertFileByteStable(t, dataDir, seed, "重新启动")
+
+	status2, rooms2 := getRooms(t, restarted.baseURL)
+	if status2 != http.StatusOK {
+		t.Fatalf("重启后查询状态码 = %d，期望 200", status2)
+	}
+	if len(rooms2) != 2 {
+		t.Fatalf("重启后记录数量 = %d，期望 2（缺字段的遗留记录不能被删除）", len(rooms2))
+	}
+	if !reflect.DeepEqual(rooms2, want) {
+		t.Fatalf("重启后附带字段或遗留记录未原样保留：\n得到: %v\n期望: %v", rooms2, want)
+	}
+	full, _ := rooms2[0].(map[string]any)
+	if full["note"] != "重启别丢我" {
+		t.Fatalf("备注字段丢失: %v", full["note"])
+	}
+	tags, ok := full["tags"].([]any)
+	if !ok || len(tags) != 2 || tags[1] != "😀" {
+		t.Fatalf("数组附带字段未原样保留: %v", full["tags"])
+	}
+	meta, ok := full["meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("嵌套对象附带字段丢失: %v", full["meta"])
+	}
+	board, _ := meta["board"].(map[string]any)
+	if board["size"] != float64(15) {
+		t.Fatalf("嵌套对象内容未原样保留: %v", meta["board"])
+	}
+	history, ok := meta["history"].([]any)
+	if !ok || len(history) != 3 || history[2] != float64(3) {
+		t.Fatalf("嵌套对象内的数组未原样保留: %v", meta["history"])
+	}
+	legacy, _ := rooms2[1].(map[string]any)
+	if legacy["id"] != "restart-legacy" || legacy["name"] != "遗留房间" {
+		t.Fatalf("缺字段的遗留记录被改动: %v", legacy)
+	}
+	assertFileByteStable(t, dataDir, seed, "重启后查询列表")
+
+	// 重启后合法创建：只在原记录之后追加，旧记录一条不动。
+	status3, created := postRoom(t, restarted.baseURL, `{"name":"重启后追加房","game":"ludo","capacity":2,"turnSeconds":30}`)
+	if status3 != http.StatusCreated {
+		t.Fatalf("重启后创建状态码 = %d，期望 201，响应: %v", status3, created)
+	}
+	_, rooms3 := getRooms(t, restarted.baseURL)
+	if len(rooms3) != 3 {
+		t.Fatalf("追加后记录数量 = %d，期望 3", len(rooms3))
+	}
+	if !reflect.DeepEqual(rooms3[:2], want) {
+		t.Fatalf("追加后旧记录被改动：\n得到: %v\n期望: %v", rooms3[:2], want)
+	}
+	if !reflect.DeepEqual(rooms3[2], created) {
+		t.Fatalf("新记录与创建响应不一致：\n列表: %v\n响应: %v", rooms3[2], created)
+	}
+
+	restarted.stopGracefully(t)
+}
+
+// 停止后保留的数据已损坏（被截断，或顶层是 null 而不是数组）时，
+// 用同一目录重启：列表查询与合法创建都必须返回 500，error 明确指向房间数据的
+// 读取或解析失败；不能返回成功的空列表或新房间编号；
+// 损坏的原数据不能被清空、替换或追加。
+func TestCorruptRetainedDataFailsAfterRestart(t *testing.T) {
+	cases := []struct {
+		name    string
+		corrupt func(valid []byte) []byte
+		needArr bool // error 是否还需明确指出“数组”
+	}{
+		{
+			name: "保留数据被截断",
+			corrupt: func(valid []byte) []byte {
+				// 从真实保留文件上不断截掉后半段，直到其确实无法解析为数组。
+				corrupt := valid
+				for {
+					corrupt = corrupt[:len(corrupt)/2]
+					var probe []any
+					if json.Unmarshal(corrupt, &probe) != nil {
+						return corrupt
+					}
+					if len(corrupt) == 0 {
+						return corrupt
+					}
+				}
+			},
+			needArr: false,
+		},
+		{
+			name:    "顶层是 null 而不是数组",
+			corrupt: func(_ []byte) []byte { return []byte("null\n") },
+			needArr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+
+			// 先正常创建两间房并正常停止，得到真实的保留数据。
+			first := startManagedServer(t, dataDir)
+			if s, _ := postRoom(t, first.baseURL, `{"name":"损坏前五子棋","game":"gomoku","capacity":2,"turnSeconds":0}`); s != http.StatusCreated {
+				t.Fatalf("准备数据：创建房间一失败，状态码 %d", s)
+			}
+			if s, _ := postRoom(t, first.baseURL, `{"name":"损坏前飞行棋","game":"ludo","capacity":4,"turnSeconds":120}`); s != http.StatusCreated {
+				t.Fatalf("准备数据：创建房间二失败，状态码 %d", s)
+			}
+			if s, rooms := getRooms(t, first.baseURL); s != http.StatusOK || len(rooms) != 2 {
+				t.Fatalf("准备数据：停止前列表异常，状态码 %d 数量 %d", s, len(rooms))
+			}
+			first.stopGracefully(t)
+
+			// 停止后破坏保留下来的数据。
+			corrupt := tc.corrupt(readDataFile(t, dataDir))
+			if err := os.WriteFile(filepath.Join(dataDir, "rooms.json"), corrupt, 0o644); err != nil {
+				t.Fatalf("写入损坏数据失败: %v", err)
+			}
+
+			// 用同一目录重启：服务可以启动，但读取房间时必须明确报错。
+			restarted := startManagedServer(t, dataDir)
+			assertFileByteStable(t, dataDir, corrupt, "带损坏数据重新启动")
+
+			getStatus, getBody := getRoomsResponse(t, restarted.baseURL)
+			if getStatus != http.StatusInternalServerError {
+				t.Fatalf("损坏数据查询状态码 = %d，期望 500，响应: %v", getStatus, getBody)
+			}
+			getErr, _ := getBody["error"].(string)
+			if !strings.Contains(getErr, "房间数据") {
+				t.Fatalf("查询 error 应明确说明房间数据读取或解析失败，实际: %q", getErr)
+			}
+			if tc.needArr && !strings.Contains(getErr, "数组") {
+				t.Fatalf("顶层 null 时 error 应明确说明房间数据必须是数组，实际: %q", getErr)
+			}
+			if _, ok := getBody["rooms"]; ok {
+				t.Fatalf("损坏数据不能返回成功的房间列表（即使为空），实际: %v", getBody["rooms"])
+			}
+			assertFileByteStable(t, dataDir, corrupt, "损坏数据查询")
+
+			// 提交一份完全合法的创建请求：必须 500 且无新编号，不能追加或替换原数据。
+			postStatus, postBody := postRoom(t, restarted.baseURL, `{"name":"损坏后仍要创建","game":"gomoku","capacity":2,"turnSeconds":30}`)
+			if postStatus != http.StatusInternalServerError {
+				t.Fatalf("损坏数据下创建状态码 = %d，期望 500，响应: %v", postStatus, postBody)
+			}
+			postErr, _ := postBody["error"].(string)
+			if !strings.Contains(postErr, "房间数据") {
+				t.Fatalf("创建 error 应明确说明房间数据读取或解析失败，实际: %q", postErr)
+			}
+			if tc.needArr && !strings.Contains(postErr, "数组") {
+				t.Fatalf("顶层 null 时创建 error 应明确说明房间数据必须是数组，实际: %q", postErr)
+			}
+			if strings.Contains(postErr, "缺少必填字段") || strings.Contains(postErr, "不能为空") {
+				t.Fatalf("损坏数据的错误不应归为用户输入问题，实际: %q", postErr)
+			}
+			if _, ok := postBody["id"]; ok {
+				t.Fatalf("损坏数据下不能返回新房间编号，实际: %v", postBody)
+			}
+			// 原损坏数据逐字节保留：未被清空、替换为 [] 或追加新记录。
+			assertFileByteStable(t, dataDir, corrupt, "损坏数据下创建")
+
+			restarted.stopGracefully(t)
+			if got := readDataFile(t, dataDir); !bytes.Equal(got, corrupt) {
+				t.Fatalf("再次停止后损坏数据被改动：\n得到: %s", got)
+			}
+		})
+	}
+}
+
+// 真正的空数组表示没有房间：空数据目录首次启动又正常停止后，文件为 []，
+// 用同一目录重启，查询成功且列表为空（启动与查询都不改写文件），
+// 随后创建的第一条记录可以被查询到，且与创建响应一致。
+func TestEmptyArrayAcrossRestartThenCreateFirst(t *testing.T) {
+	dataDir := t.TempDir()
+
+	// 首次启动后不创建任何房间，正常停止。
+	first := startManagedServer(t, dataDir)
+	first.stopGracefully(t)
+
+	emptyFile := readDataFile(t, dataDir)
+	if got := decodeRecords(t, emptyFile); len(got) != 0 {
+		t.Fatalf("首次停止后应为空数组，实际: %s", emptyFile)
+	}
+
+	restarted := startManagedServer(t, dataDir)
+	assertFileByteStable(t, dataDir, emptyFile, "空数组重新启动")
+
+	status, rooms := getRooms(t, restarted.baseURL)
+	if status != http.StatusOK {
+		t.Fatalf("空数组重启后查询状态码 = %d，期望 200", status)
+	}
+	if len(rooms) != 0 {
+		t.Fatalf("空数组重启后列表数量 = %d，期望 0", len(rooms))
+	}
+	assertFileByteStable(t, dataDir, emptyFile, "空数组查询列表")
+
+	// 随后创建第一条记录，可以被查询到。
+	createStatus, created := postRoom(t, restarted.baseURL, `{"name":"重启后的第一间","game":"gomoku","capacity":2,"turnSeconds":0}`)
+	if createStatus != http.StatusCreated {
+		t.Fatalf("空数组重启后创建状态码 = %d，期望 201，响应: %v", createStatus, created)
+	}
+	if id, _ := created["id"].(string); id == "" {
+		t.Fatal("第一条房间编号为空")
+	}
+	listStatus, list := getRooms(t, restarted.baseURL)
+	if listStatus != http.StatusOK || len(list) != 1 {
+		t.Fatalf("创建后列表状态码 = %d、数量 = %d，期望 200/1", listStatus, len(list))
+	}
+	if !reflect.DeepEqual(list[0], created) {
+		t.Fatalf("查询到的第一条记录与创建响应不一致：\n列表: %v\n响应: %v", list[0], created)
+	}
+
+	restarted.stopGracefully(t)
 }
