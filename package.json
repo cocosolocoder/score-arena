@@ -5,7 +5,7 @@
   "type": "module",
   "description": "ScoreArena 首页创建公开房间功能的界面回归测试（不改动现有 Go 代码与接口约定）",
   "scripts": {
-    "test": "node --test ui.test.mjs ui-capacity-linkage.test.mjs ui-turn-seconds.test.mjs ui-mixed-records.test.mjs ui-create-connection-failure.test.mjs"
+    "test": "node --test ui.test.mjs ui-capacity-linkage.test.mjs ui-turn-seconds.test.mjs ui-mixed-records.test.mjs ui-create-connection-failure.test.mjs ui-name-plain-text.test.mjs"
   },
   "devDependencies": {
     "puppeteer-core": "^24.0.0"
