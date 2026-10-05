@@ -685,6 +685,233 @@ func TestGetRoomsPreservesMixedRawRecords(t *testing.T) {
 	}
 }
 
+// 游戏规则与人数上限必须匹配：五子棋固定 2 人，飞行棋 2 至 4 人。
+// 直接调用创建接口（不经过页面联动）时，合法组合应照常创建：201、非空编号、
+// 规则与人数和提交值一致（飞行棋 2/3/4 不能都被保存成 2），其余配置沿用提交值，
+// 房间公开且未开始，并作为同一条记录追加在原有房间之后。
+func TestCreateRoomAcceptsMatchingGameAndCapacity(t *testing.T) {
+	dataDir := t.TempDir()
+	seed := seedRooms(t, dataDir, seedRecord1, seedRecord2)
+	baseURL := startServer(t, dataDir)
+
+	cases := []struct {
+		roomName    string
+		game        string
+		capacity    int
+		turnSeconds int
+	}{
+		{"午后五子棋", "gomoku", 2, 0},
+		{"双人飞行棋", "ludo", 2, 30},
+		{"三人飞行棋", "ludo", 3, 45},
+		{"四人飞行棋", "ludo", 4, 60},
+	}
+
+	createdRooms := make([]map[string]any, 0, len(cases))
+	seenIDs := map[string]bool{"seed-alpha": true, "seed-beta": true}
+	for _, tc := range cases {
+		// 名称带首尾空白，验证仍按现有方式整理；人数校验不得改变其他配置。
+		body, _ := json.Marshal(map[string]any{
+			"name":        "  " + tc.roomName + "  ",
+			"game":        tc.game,
+			"capacity":    tc.capacity,
+			"turnSeconds": tc.turnSeconds,
+		})
+		status, created := postRoom(t, baseURL, string(body))
+		if status != http.StatusCreated {
+			t.Fatalf("%s（%s/%d 人）创建状态码 = %d，期望 201，响应: %v", tc.roomName, tc.game, tc.capacity, status, created)
+		}
+		id, _ := created["id"].(string)
+		if id == "" {
+			t.Fatalf("%s（%s/%d 人）新房间编号为空", tc.roomName, tc.game, tc.capacity)
+		}
+		if seenIDs[id] {
+			t.Fatalf("%s（%s/%d 人）新房间编号 %q 与已有编号重复", tc.roomName, tc.game, tc.capacity, id)
+		}
+		seenIDs[id] = true
+		if got := created["game"]; got != tc.game {
+			t.Fatalf("%s 保存的规则 = %v，期望 %q", tc.roomName, got, tc.game)
+		}
+		if got, want := created["capacity"], float64(tc.capacity); got != want {
+			t.Fatalf("%s（%s）保存的人数 = %v，期望 %v（所选人数必须原样保存）", tc.roomName, tc.game, got, want)
+		}
+		if got := created["name"]; got != tc.roomName {
+			t.Fatalf("名称 = %v，期望 %q（仅去掉首尾空白）", got, tc.roomName)
+		}
+		if got, want := created["turnSeconds"], float64(tc.turnSeconds); got != want {
+			t.Fatalf("%s 保存的每步时间 = %v，期望 %v（人数校验不得改变其他配置）", tc.roomName, got, want)
+		}
+		if got := created["status"]; got != "waiting" {
+			t.Fatalf("%s 状态 = %v，期望 waiting（未开始）", tc.roomName, got)
+		}
+		if got := created["visibility"]; got != "public" {
+			t.Fatalf("%s 公开范围 = %v，期望 public", tc.roomName, got)
+		}
+		createdRooms = append(createdRooms, created)
+	}
+
+	// 飞行棋三种人数必须分别保存为 2、3、4，不能都被存成 2。
+	ludoCapacities := []float64{}
+	for i, tc := range cases {
+		if tc.game == "ludo" {
+			ludoCapacities = append(ludoCapacities, createdRooms[i]["capacity"].(float64))
+		}
+	}
+	if !reflect.DeepEqual(ludoCapacities, []float64{2, 3, 4}) {
+		t.Fatalf("飞行棋各房间保存的人数 = %v，期望 [2 3 4]（不能都被保存成 2）", ludoCapacities)
+	}
+
+	// 列表：原有记录在前且不变，新房间按提交顺序追加在后，与创建响应一致。
+	listStatus, rooms := getRooms(t, baseURL)
+	if listStatus != http.StatusOK {
+		t.Fatalf("GET /api/rooms 状态码 = %d，期望 200", listStatus)
+	}
+	if len(rooms) != 2+len(cases) {
+		t.Fatalf("房间数量 = %d，期望 %d（原有 2 条 + 新增 %d 条）", len(rooms), 2+len(cases), len(cases))
+	}
+	if want := decodeRecords(t, seed); !reflect.DeepEqual(rooms[:2], want) {
+		t.Fatalf("原有房间被改写或重新排序：\n得到: %v\n期望: %v", rooms[:2], want)
+	}
+	for i, created := range createdRooms {
+		if !reflect.DeepEqual(rooms[2+i], created) {
+			t.Fatalf("列表中第 %d 条新记录与创建响应不一致：\n列表: %v\n响应: %v", i+1, rooms[2+i], created)
+		}
+	}
+}
+
+// 规则与人数不匹配时必须拒绝：五子棋提交 3 或 4 人、飞行棋提交 1 或 5 人，
+// 返回 400 且 error 清楚说明该规则允许的人数，不得悄悄改成合法值后创建。
+// 名称与每步时间都合法时，错误原因必须落在规则与人数上；已有房间的数量、次序、
+// 内容与附带字段保持原样，本地文件不被改写，拒绝响应不带成功房间编号。
+// 把人数改成规则允许的值后再次提交，应正常创建，之前被拒绝的配置不留记录。
+func TestCreateRoomRejectedWhenCapacityMismatchesGame(t *testing.T) {
+	dataDir := t.TempDir()
+	seed := seedRooms(t, dataDir, seedRecord1, seedRecord2)
+	baseURL := startServer(t, dataDir)
+
+	cases := []struct {
+		game     string
+		capacity int
+		errParts []string
+	}{
+		{"gomoku", 3, []string{"五子棋", "2"}},
+		{"gomoku", 4, []string{"五子棋", "2"}},
+		{"ludo", 1, []string{"飞行棋", "2", "4"}},
+		{"ludo", 5, []string{"飞行棋", "2", "4"}},
+	}
+	for _, tc := range cases {
+		// 名称与每步时间都合法，错误原因只能落在规则与人数上。
+		body, _ := json.Marshal(map[string]any{
+			"name":        "人数不匹配房",
+			"game":        tc.game,
+			"capacity":    tc.capacity,
+			"turnSeconds": 30,
+		})
+		status, rejected := postRoom(t, baseURL, string(body))
+		if status != http.StatusBadRequest {
+			t.Fatalf("%s/%d 人状态码 = %d，期望 400，响应: %v", tc.game, tc.capacity, status, rejected)
+		}
+		errMsg, _ := rejected["error"].(string)
+		for _, part := range tc.errParts {
+			if !strings.Contains(errMsg, part) {
+				t.Fatalf("%s/%d 人的 error 应包含 %q 以说明该规则允许的人数，实际: %q", tc.game, tc.capacity, part, errMsg)
+			}
+		}
+		if strings.Contains(errMsg, "名称") || strings.Contains(errMsg, "时间") || strings.Contains(errMsg, "turnSeconds") {
+			t.Fatalf("%s/%d 人：名称与时间均合法，error 不应落在它们上，实际: %q", tc.game, tc.capacity, errMsg)
+		}
+		if _, ok := rejected["id"]; ok {
+			t.Fatalf("%s/%d 人被拒绝时不应返回房间编号，实际: %v", tc.game, tc.capacity, rejected)
+		}
+	}
+
+	// 全部拒绝之后：房间数量、次序、内容及附带字段保持原样，本地文件未被改写。
+	assertRoomsUnchanged(t, baseURL, dataDir, seed)
+
+	// 用户把人数改成对应规则允许的值再次提交，应正常创建。
+	status, created := postRoom(t, baseURL, `{"name":"人数不匹配房","game":"gomoku","capacity":2,"turnSeconds":30}`)
+	if status != http.StatusCreated {
+		t.Fatalf("修正人数后创建状态码 = %d，期望 201，响应: %v", status, created)
+	}
+	if id, _ := created["id"].(string); id == "" {
+		t.Fatal("修正后新房间编号为空")
+	}
+	if got := created["capacity"]; got != float64(2) {
+		t.Fatalf("修正后保存的人数 = %v，期望 2", got)
+	}
+
+	// 之前被拒绝的配置不能留下记录：只新增修正后的这一条，原有房间保持不变。
+	_, rooms := getRooms(t, baseURL)
+	if len(rooms) != 3 {
+		t.Fatalf("房间数量 = %d，期望 3（种子 2 条 + 修正后 1 条，被拒绝的配置不留记录）", len(rooms))
+	}
+	if want := decodeRecords(t, seed); !reflect.DeepEqual(rooms[:2], want) {
+		t.Fatalf("原有房间被改动：\n得到: %v\n期望: %v", rooms[:2], want)
+	}
+	if !reflect.DeepEqual(rooms[2], created) {
+		t.Fatalf("列表中的新记录与创建响应不一致：\n列表: %v\n响应: %v", rooms[2], created)
+	}
+}
+
+// 人数没有提供，或以字符串、小数、null 提供时，同样必须拒绝：
+// 区分“缺少必填字段”与“人数不是整数”，不能先转换、取整或补默认人数再保存。
+// 名称与每步时间都合法时，错误原因必须落在人数上。
+func TestCreateRoomRejectedWhenCapacityMissingOrNotInteger(t *testing.T) {
+	dataDir := t.TempDir()
+	seed := seedRooms(t, dataDir, seedRecord1, seedRecord2)
+	baseURL := startServer(t, dataDir)
+
+	cases := []struct {
+		name     string
+		body     string
+		errParts []string
+	}{
+		{"缺少 capacity", `{"name":"缺人数房","game":"ludo","turnSeconds":30}`, []string{"缺少必填字段", "capacity"}},
+		{"字符串人数", `{"name":"字符串人数房","game":"ludo","capacity":"3","turnSeconds":30}`, []string{"capacity", "整数"}},
+		{"小数人数", `{"name":"小数人数房","game":"ludo","capacity":2.5,"turnSeconds":30}`, []string{"capacity", "整数"}},
+		{"null 人数", `{"name":"空值人数房","game":"ludo","capacity":null,"turnSeconds":30}`, []string{"capacity", "整数"}},
+	}
+	for _, tc := range cases {
+		status, rejected := postRoom(t, baseURL, tc.body)
+		if status != http.StatusBadRequest {
+			t.Fatalf("%s：状态码 = %d，期望 400，响应: %v", tc.name, status, rejected)
+		}
+		errMsg, _ := rejected["error"].(string)
+		for _, part := range tc.errParts {
+			if !strings.Contains(errMsg, part) {
+				t.Fatalf("%s：error 应包含 %q，实际: %q", tc.name, part, errMsg)
+			}
+		}
+		if strings.Contains(errMsg, "名称") || strings.Contains(errMsg, "时间") || strings.Contains(errMsg, "turnSeconds") {
+			t.Fatalf("%s：名称与时间均合法，error 不应落在它们上，实际: %q", tc.name, errMsg)
+		}
+		if _, ok := rejected["id"]; ok {
+			t.Fatalf("%s：被拒绝时不应返回房间编号，实际: %v", tc.name, rejected)
+		}
+	}
+
+	// 全部被拒绝后，已有房间与本地文件保持原样（null 不能被当成 0 或默认人数保存）。
+	assertRoomsUnchanged(t, baseURL, dataDir, seed)
+
+	// 补上合法整数人数后应正常创建，之前被拒绝的请求不留记录。
+	status, created := postRoom(t, baseURL, `{"name":"缺人数房","game":"ludo","capacity":3,"turnSeconds":30}`)
+	if status != http.StatusCreated {
+		t.Fatalf("补上合法人数后创建状态码 = %d，期望 201，响应: %v", status, created)
+	}
+	if got := created["capacity"]; got != float64(3) {
+		t.Fatalf("修正后保存的人数 = %v，期望 3", got)
+	}
+	_, rooms := getRooms(t, baseURL)
+	if len(rooms) != 3 {
+		t.Fatalf("房间数量 = %d，期望 3（种子 2 条 + 修正后 1 条，被拒绝的请求不留记录）", len(rooms))
+	}
+	if want := decodeRecords(t, seed); !reflect.DeepEqual(rooms[:2], want) {
+		t.Fatalf("原有房间被改动：\n得到: %v\n期望: %v", rooms[:2], want)
+	}
+	if !reflect.DeepEqual(rooms[2], created) {
+		t.Fatalf("列表中的新记录与创建响应不一致：\n列表: %v\n响应: %v", rooms[2], created)
+	}
+}
+
 // 只含会被去掉的首尾空白（含 U+0085、U+00A0）的名称视为空，
 // 返回 400 并说明名称不能为空，不返回新房间编号，已有数据保持不变。
 func TestCreateRoomRejectedWhenNameOnlyWhitespace(t *testing.T) {
