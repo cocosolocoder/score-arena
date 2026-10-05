@@ -269,60 +269,87 @@
     td.textContent = BAD_FIELD_TEXT;
   }
 
-  // 逐单元格渲染一个房间行：任何字段异常都只替换该单元格，其余字段照常显示。
-  function buildRoomRow(r) {
-    var tr = document.createElement('tr');
-
-    var tdId = document.createElement('td');
-    tdId.className = 'id';
-    if (isAbnormalField(r.id)) markBadCell(tdId);
-    else tdId.textContent = r.id || '';
-    tr.appendChild(tdId);
-
-    var tdName = document.createElement('td');
-    if (isAbnormalField(r.name)) markBadCell(tdName);
-    else tdName.textContent = r.name || '';
-    tr.appendChild(tdName);
-
-    var tdGame = document.createElement('td');
-    if (isAbnormalField(r.game)) markBadCell(tdGame);
-    else tdGame.textContent = GAME_LABELS[r.game] || r.game || '';
-    tr.appendChild(tdGame);
-
-    var tdCap = document.createElement('td');
-    if (isAbnormalField(r.capacity)) markBadCell(tdCap);
-    else tdCap.textContent = (r.capacity != null ? r.capacity : '') + ' 人';
-    tr.appendChild(tdCap);
-
-    var tdTurn = document.createElement('td');
-    if (isAbnormalField(r.turnSeconds)) {
-      markBadCell(tdTurn);
-    } else if (r.turnSeconds === 0) {
-      tdTurn.textContent = '不限时';
-    } else {
-      tdTurn.textContent = r.turnSeconds + ' 秒';
-    }
-    tr.appendChild(tdTurn);
-
-    var tdStatus = document.createElement('td');
+  function appendBadge(td, text) {
     var badge = document.createElement('span');
     badge.className = 'badge';
-    if (isAbnormalField(r.status)) badge.textContent = BAD_FIELD_TEXT;
-    else badge.textContent = STATUS_LABELS[r.status] || r.status || '';
-    tdStatus.appendChild(badge);
-    tr.appendChild(tdStatus);
+    badge.textContent = text;
+    td.appendChild(badge);
+  }
 
-    var tdTime = document.createElement('td');
-    if (isAbnormalField(r.createdAt)) {
-      // 异常创建时间只显示异常文案，不附加日期悬浮说明（不设置 title）。
-      markBadCell(tdTime);
-    } else {
-      var t = formatTime(r.createdAt || '');
-      tdTime.textContent = t.text;
-      tdTime.title = t.title;
+  // 七列的展示定义，顺序即表格列顺序（表头也由同一份定义生成）。每列只
+  // 描述“正常值如何显示”（含各列原有的兜底行为）；对象/数组的异常判定
+  // 与替换由 buildRoomRow 统一处理，不在各列重复维护。个别列可用
+  // renderBad 保留原有容器（如状态列的徽标），缺省时整格替换为异常文案。
+  var ROOM_COLUMNS = [
+    {
+      key: 'id',
+      label: '房间编号',
+      className: 'id',
+      render: function (td, value) { td.textContent = value || ''; }
+    },
+    {
+      key: 'name',
+      label: '名称',
+      render: function (td, value) { td.textContent = value || ''; }
+    },
+    {
+      key: 'game',
+      label: '规则',
+      render: function (td, value) {
+        td.textContent = GAME_LABELS[value] || value || '';
+      }
+    },
+    {
+      key: 'capacity',
+      label: '人数上限',
+      render: function (td, value) {
+        td.textContent = (value != null ? value : '') + ' 人';
+      }
+    },
+    {
+      key: 'turnSeconds',
+      label: '时间限制',
+      render: function (td, value) {
+        td.textContent = value === 0 ? '不限时' : value + ' 秒';
+      }
+    },
+    {
+      key: 'status',
+      label: '状态',
+      render: function (td, value) {
+        appendBadge(td, STATUS_LABELS[value] || value || '');
+      },
+      // 异常状态仍在原有徽标中显示提示文案。
+      renderBad: function (td) { appendBadge(td, BAD_FIELD_TEXT); }
+    },
+    {
+      key: 'createdAt',
+      label: '创建时间',
+      render: function (td, value) {
+        var t = formatTime(value || '');
+        td.textContent = t.text;
+        td.title = t.title;
+      }
+      // 无 renderBad：异常创建时间只显示异常文案，不附加日期悬浮说明
+      // （不设置 title）。
     }
-    tr.appendChild(tdTime);
+  ];
 
+  // 逐列渲染一个房间行：任何字段异常都只替换该单元格，其余字段照常显示。
+  function buildRoomRow(r) {
+    var tr = document.createElement('tr');
+    ROOM_COLUMNS.forEach(function (col) {
+      var td = document.createElement('td');
+      if (col.className) td.className = col.className;
+      var value = r[col.key];
+      if (isAbnormalField(value)) {
+        if (col.renderBad) col.renderBad(td);
+        else markBadCell(td);
+      } else {
+        col.render(td, value);
+      }
+      tr.appendChild(td);
+    });
     return tr;
   }
 
@@ -351,11 +378,15 @@
     if (skipped > 0) appendSkipNotice(skipped, false);
 
     var table = document.createElement('table');
-    table.innerHTML =
-      '<thead><tr>' +
-      '<th>房间编号</th><th>名称</th><th>规则</th><th>人数上限</th>' +
-      '<th>时间限制</th><th>状态</th><th>创建时间</th>' +
-      '</tr></thead>';
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    ROOM_COLUMNS.forEach(function (col) {
+      var th = document.createElement('th');
+      th.textContent = col.label;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
     var tbody = document.createElement('tbody');
     validRooms.forEach(function (r) {
       tbody.appendChild(buildRoomRow(r));
