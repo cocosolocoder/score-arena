@@ -58,14 +58,26 @@ func newRoomStore(path string) *roomStore {
 
 // load 读取数据文件，返回顶层数组中的原始记录以及已占用的房间编号。
 // 文件无法读取或不是合法数组时返回错误，绝不重置已有数据。
-// 数组中的非对象元素原样保留（兼容历史记录及其附带字段）。
+// 顶层 JSON 值必须是数组：null、对象、字符串等都不是“没有房间”，
+// （Go 把顶层 null 解进切片会当成无操作而得到空切片，因此必须先辨别类型）
+// 只有空数组才表示没有记录。数组中的非对象元素原样保留（兼容历史记录及其附带字段）。
 func (s *roomStore) load() ([]json.RawMessage, map[string]bool, error) {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("读取房间数据失败: %w", err)
 	}
+	// 先解出顶层原始值：json.Decoder 会跳过 null 前后的合法 JSON 空白，
+	// 既能精确判断顶层类型，也顺带拒绝尾随多余内容。
+	var top json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return nil, nil, fmt.Errorf("房间数据不是合法的数组: %w", err)
+	}
+	trimmed := strings.TrimSpace(string(top))
+	if trimmed == "" || trimmed[0] != '[' {
+		return nil, nil, errors.New("房间数据必须是数组，不能是 null 或其他非数组内容")
+	}
 	var records []json.RawMessage
-	if err := json.Unmarshal(raw, &records); err != nil {
+	if err := json.Unmarshal(top, &records); err != nil {
 		return nil, nil, fmt.Errorf("房间数据不是合法的数组: %w", err)
 	}
 	used := make(map[string]bool, len(records))

@@ -509,6 +509,48 @@ func TestCreateRoomFailsWhenDataIsObjectNotArray(t *testing.T) {
 	assertCreateFailsOnUnreadableData(t, baseURL, dataDir, seed)
 }
 
+// 整份数据是 JSON null 时，null 不表示“还没有房间”：公开约定要求顶层必须是
+// 数组，只有空数组才表示没有记录。查询必须返回 500（不能返回成功的 rooms 内容），
+// 合法创建同样必须返回 500 且原因落在已保存的房间数据上；文件内容逐字节保留，
+// 不能被替换为空数组、追加房间或改写周围空白。null 前后的合法 JSON 空白一视同仁。
+func TestRoomsFailWhenDataIsNull(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"仅 null", "null\n"},
+		{"null 前后带合法 JSON 空白", " \t null \r\n"},
+		{"制表符与换行包围的 null", "\t\nnull\n\t"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			seed := seedRaw(t, dataDir, tc.content)
+			baseURL := startServer(t, dataDir)
+
+			assertCreateFailsOnUnreadableData(t, baseURL, dataDir, seed)
+
+			// 失败信息必须明确指出房间数据必须是数组，与输入类错误区分开。
+			status, body := postRoom(t, baseURL, `{"name":"null 数据复验房","game":"gomoku","capacity":2,"turnSeconds":30}`)
+			if status != http.StatusInternalServerError {
+				t.Fatalf("再次创建状态码 = %d，期望 500，响应: %v", status, body)
+			}
+			errMsg, _ := body["error"].(string)
+			if !strings.Contains(errMsg, "数组") {
+				t.Fatalf("error 应明确说明房间数据必须是数组，实际: %q", errMsg)
+			}
+			if strings.Contains(errMsg, "缺少必填字段") || strings.Contains(errMsg, "不能为空") {
+				t.Fatalf("error 不应把格式错误归为用户漏填字段，实际: %q", errMsg)
+			}
+
+			// 文件仍逐字节保留为最初的 null 内容。
+			if got := readDataFile(t, dataDir); !bytes.Equal(got, seed) {
+				t.Fatalf("数据文件被改动：\n得到: %s\n期望: %s", got, seed)
+			}
+		})
+	}
+}
+
 // 已有内容是带正常 JSON 空白的空数组时，属于合法空列表：
 // 创建应照常返回 201，查询能得到与创建响应一致的那一个新房间。
 func TestCreateRoomOnEmptyArrayWithWhitespace(t *testing.T) {
