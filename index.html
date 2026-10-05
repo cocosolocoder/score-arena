@@ -256,6 +256,75 @@
     listArea.appendChild(p);
   }
 
+  // 历史记录的某个展示字段若被存成 JSON 对象或数组，该单元格统一显示
+  // “字段格式异常”，不展开其内部内容；异常只影响所在单元格，绝不能抛出
+  // 异常拖垮整行乃至整份列表。null、字符串、数字、布尔值及缺失字段都不算
+  // 异常，仍走各列原有的展示与兜底。
+  var BAD_FIELD_TEXT = '字段格式异常';
+  function isAbnormalField(value) {
+    return value !== null && typeof value === 'object';
+  }
+  function markBadCell(td) {
+    td.textContent = BAD_FIELD_TEXT;
+  }
+
+  // 逐单元格渲染一个房间行：任何字段异常都只替换该单元格，其余字段照常显示。
+  function buildRoomRow(r) {
+    var tr = document.createElement('tr');
+
+    var tdId = document.createElement('td');
+    tdId.className = 'id';
+    if (isAbnormalField(r.id)) markBadCell(tdId);
+    else tdId.textContent = r.id || '';
+    tr.appendChild(tdId);
+
+    var tdName = document.createElement('td');
+    if (isAbnormalField(r.name)) markBadCell(tdName);
+    else tdName.textContent = r.name || '';
+    tr.appendChild(tdName);
+
+    var tdGame = document.createElement('td');
+    if (isAbnormalField(r.game)) markBadCell(tdGame);
+    else tdGame.textContent = GAME_LABELS[r.game] || r.game || '';
+    tr.appendChild(tdGame);
+
+    var tdCap = document.createElement('td');
+    if (isAbnormalField(r.capacity)) markBadCell(tdCap);
+    else tdCap.textContent = (r.capacity != null ? r.capacity : '') + ' 人';
+    tr.appendChild(tdCap);
+
+    var tdTurn = document.createElement('td');
+    if (isAbnormalField(r.turnSeconds)) {
+      markBadCell(tdTurn);
+    } else if (r.turnSeconds === 0) {
+      tdTurn.textContent = '不限时';
+    } else {
+      tdTurn.textContent = r.turnSeconds + ' 秒';
+    }
+    tr.appendChild(tdTurn);
+
+    var tdStatus = document.createElement('td');
+    var badge = document.createElement('span');
+    badge.className = 'badge';
+    if (isAbnormalField(r.status)) badge.textContent = BAD_FIELD_TEXT;
+    else badge.textContent = STATUS_LABELS[r.status] || r.status || '';
+    tdStatus.appendChild(badge);
+    tr.appendChild(tdStatus);
+
+    var tdTime = document.createElement('td');
+    if (isAbnormalField(r.createdAt)) {
+      // 异常创建时间只显示异常文案，不附加日期悬浮说明（不设置 title）。
+      markBadCell(tdTime);
+    } else {
+      var t = formatTime(r.createdAt || '');
+      tdTime.textContent = t.text;
+      tdTime.title = t.title;
+    }
+    tr.appendChild(tdTime);
+
+    return tr;
+  }
+
   function renderRooms(rooms) {
     listArea.innerHTML = '';
 
@@ -288,44 +357,7 @@
       '</tr></thead>';
     var tbody = document.createElement('tbody');
     validRooms.forEach(function (r) {
-      var tr = document.createElement('tr');
-
-      var tdId = document.createElement('td');
-      tdId.className = 'id';
-      tdId.textContent = r.id || '';
-      tr.appendChild(tdId);
-
-      var tdName = document.createElement('td');
-      tdName.textContent = r.name || '';
-      tr.appendChild(tdName);
-
-      var tdGame = document.createElement('td');
-      tdGame.textContent = GAME_LABELS[r.game] || r.game || '';
-      tr.appendChild(tdGame);
-
-      var tdCap = document.createElement('td');
-      tdCap.textContent = (r.capacity != null ? r.capacity : '') + ' 人';
-      tr.appendChild(tdCap);
-
-      var tdTurn = document.createElement('td');
-      if (r.turnSeconds === 0) tdTurn.textContent = '不限时';
-      else tdTurn.textContent = r.turnSeconds + ' 秒';
-      tr.appendChild(tdTurn);
-
-      var tdStatus = document.createElement('td');
-      var badge = document.createElement('span');
-      badge.className = 'badge';
-      badge.textContent = STATUS_LABELS[r.status] || r.status || '';
-      tdStatus.appendChild(badge);
-      tr.appendChild(tdStatus);
-
-      var tdTime = document.createElement('td');
-      var t = formatTime(r.createdAt || '');
-      tdTime.textContent = t.text;
-      tdTime.title = t.title;
-      tr.appendChild(tdTime);
-
-      tbody.appendChild(tr);
+      tbody.appendChild(buildRoomRow(r));
     });
     table.appendChild(tbody);
     listArea.appendChild(table);

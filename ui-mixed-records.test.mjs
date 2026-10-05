@@ -396,8 +396,195 @@ test('查看混合列表后：接口原始记录与本地文件的数量、次�
   assert.equal(onDisk, seedText, '查看列表不应改写本地保存的原始记录');
 });
 
-// 混合数据下创建公开房间的既有行为不变：原始的非对象记录与附带字段原样保留
-// 在原位置，新房间作为对象追加为最后一行，跳过数量不变、提示仍在。
+// 两个完全正常的房间，分别放在异常记录前后，证明异常字段不会拖累相邻房间。
+const OK_BEFORE =
+  '{"id":"ok-before","name":"正常前房间","game":"gomoku","capacity":2,"turnSeconds":0,' +
+  '"status":"waiting","createdAt":"2026-03-02T01:02:03Z"}';
+const OK_AFTER =
+  '{"id":"ok-after","name":"正常后房间","game":"ludo","capacity":3,"turnSeconds":300,' +
+  '"status":"playing","createdAt":"2026-03-03T04:05:06Z"}';
+// 名称被存成 {"toString":"旧名称"}：修复前它会让 new Date()/textContent 抛异常，
+// 整份列表显示加载失败；修复后只影响名称单元格。
+const BAD_NAME =
+  '{"id":"bad-name","name":{"toString":"旧名称"},"game":"gomoku","capacity":2,' +
+  '"turnSeconds":0,"status":"waiting","createdAt":"2026-03-04T07:08:09Z"}';
+// 七个展示字段全部是对象或数组：每个单元格都只显示“字段格式异常”，
+// 规则对象里即使带 "v":"ludo" 也不能映射出“飞行棋”，内部内容一律不展开。
+const BAD_ALL =
+  '{"id":{"v":"内嵌编号"},"name":["数组名称"],"game":{"v":"ludo"},' +
+  '"capacity":{"v":4},"turnSeconds":[30],"status":{"v":"waiting"},' +
+  '"createdAt":{"v":"2026-03-05T00:00:00Z"}}';
+// 同一房间只有人数与时间两个字段异常：只替换这两个单元格，其余照常显示。
+const BAD_MIX =
+  '{"id":"bad-mix","name":"部分异常房","game":"ludo","capacity":[3],' +
+  '"turnSeconds":{"v":60},"status":"waiting","createdAt":"2026-03-06T09:10:11Z",' +
+  '"note":"附带字段保留"}';
+const BAD_FIELD_TEXT = '字段格式异常';
+
+// 异常字段只影响所在单元格：前后的正常房间行照常显示，异常对象仍是一行、
+// 按相对次序排列且不计跳过；异常人数/时间不附“人/秒”，异常创建时间没有
+// 悬浮说明，任何内部内容都不展开上屏。
+test('异常字段（对象/数组）只替换所在单元格，不拖累同房间其他字段或其他房间行', { timeout: 60000 }, async (t) => {
+  const { page } = await setupMixedPage(t, [OK_BEFORE, BAD_NAME, OK_AFTER, BAD_ALL, BAD_MIX]);
+
+  await waitForRowCount(page, 5);
+  // 含异常字段的对象仍然成行，不产生任何跳过计数，更不是加载失败。
+  const list = await readListArea(page);
+  assert.equal(list.errorText, null, '异常字段不能让整份列表加载失败');
+  assert.equal(list.skipCount, 0, '含异常字段的对象不应被跳过或计数');
+  assert.equal(list.skipText, null);
+
+  const rows = await readRows(page);
+
+  // 异常房间之前的正常房间不受影响。
+  assert.deepEqual(rows[0].cells.slice(0, 6), [
+    'ok-before', '正常前房间', '五子棋', '2 人', '不限时', '未开始',
+  ]);
+  assert.equal(rows[0].timeTitle, '2026-03-02T01:02:03Z');
+
+  // 名称为 {"toString":"旧名称"} 的房间：只有名称单元格异常，其余字段照常；
+  // “旧名称”绝不能被展开或经 toString 转换后上屏。
+  assert.deepEqual(rows[1].cells.slice(0, 6), [
+    'bad-name', BAD_FIELD_TEXT, '五子棋', '2 人', '不限时', '未开始',
+  ]);
+  assert.match(rows[1].cells[6], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+  assert.equal(rows[1].badge, '未开始');
+  assert.equal(rows[1].timeTitle, '2026-03-04T07:08:09Z');
+  assert.ok(!list.text.includes('旧名称'), '异常名称的内部内容不能展开上屏');
+
+  // 异常房间之后的正常房间同样不受影响（证明它前后的房间都能查看）。
+  assert.deepEqual(rows[2].cells.slice(0, 6), [
+    'ok-after', '正常后房间', '飞行棋', '3 人', '300 秒', 'playing',
+  ]);
+
+  // 七个字段全部异常：七个单元格全部只显示异常文案，状态徽标也不例外；
+  // 规则对象不映射中文名，人数/时间不附单位，创建时间没有 title 悬浮说明。
+  assert.deepEqual(rows[3].cells, [
+    BAD_FIELD_TEXT, BAD_FIELD_TEXT, BAD_FIELD_TEXT, BAD_FIELD_TEXT,
+    BAD_FIELD_TEXT, BAD_FIELD_TEXT, BAD_FIELD_TEXT,
+  ]);
+  assert.equal(rows[3].badge, BAD_FIELD_TEXT, '异常状态应显示字段格式异常');
+  assert.equal(rows[3].timeTitle, null, '异常创建时间不应附带日期悬浮说明');
+
+  // 只有部分字段异常的房间：其余字段（含中文规则名、未开始徽标、时间格式）照常。
+  assert.deepEqual(rows[4].cells.slice(0, 6), [
+    'bad-mix', '部分异常房', '飞行棋', BAD_FIELD_TEXT, BAD_FIELD_TEXT, '未开始',
+  ]);
+  assert.match(rows[4].cells[6], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+  assert.equal(rows[4].badge, '未开始');
+  assert.equal(rows[4].timeTitle, '2026-03-06T09:10:11Z');
+
+  // 所有异常字段的内部内容都不能上屏。
+  for (const leaked of ['内嵌编号', '数组名称', '"v"', '附带字段保留']) {
+    assert.ok(!list.text.includes(leaked), '异常字段内部内容不应展开上屏：' + leaked);
+  }
+});
+
+// 异常对象位于开头、中间或末尾，都不能导致其他对象行被省略。
+test('异常对象位于开头/中间/末尾，其他房间行都不省略且次序不变', { timeout: 60000 }, async (t) => {
+  const layouts = [
+    [BAD_NAME, OK_BEFORE, OK_AFTER],
+    [OK_BEFORE, BAD_NAME, OK_AFTER],
+    [OK_BEFORE, OK_AFTER, BAD_NAME],
+  ];
+  for (const records of layouts) {
+    const { page } = await setupMixedPage(t, records);
+    await waitForRowCount(page, 3);
+    const list = await readListArea(page);
+    assert.equal(list.errorText, null);
+    assert.equal(list.rowCount, 3, '异常对象位于任意位置都不能省略其他房间行');
+    assert.deepEqual(
+      (await readRows(page)).map((r) => r.cells[0]),
+      records.map((rec, i) => JSON.parse(rec).id || ''),
+      '房间行次序应与接口中对象的相对次序一致',
+    );
+  }
+});
+
+// 即使所有对象行都含异常字段，也要保留表格和这些行：不显示空列表提示，
+// 也不显示“全部跳过”的说明（异常对象根本不计入跳过）。
+test('所有房间行都含异常字段：保留表格与全部行，无空列表提示、无跳过提示、无加载失败', { timeout: 60000 }, async (t) => {
+  const allBad = [
+    BAD_NAME,
+    '{"id":"all-bad-1","name":["名称甲"],"game":"gomoku","capacity":2,"turnSeconds":0,' +
+      '"status":"waiting","createdAt":"2026-03-07T00:00:00Z"}',
+    '{"id":"all-bad-2","name":{"x":"名称乙"},"game":{"v":"ludo"},"capacity":{"x":3},' +
+      '"turnSeconds":[60],"status":["waiting"],"createdAt":["2026-03-08T00:00:00Z"]}',
+  ];
+  const { page } = await setupMixedPage(t, allBad);
+
+  await waitForRowCount(page, 3);
+  // 给页面足够时间，确认不会迟来一个空提示或跳过说明。
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const list = await readListArea(page);
+
+  assert.equal(list.hasTable, true, '全部行含异常字段时仍应保留表格');
+  assert.equal(list.rowCount, 3);
+  assert.equal(list.errorText, null);
+  assert.equal(list.skipText, null, '异常字段对象不计入跳过，不应出现跳过提示');
+  assert.deepEqual(list.emptyTexts, [], '不能把含异常字段的房间当成空列表');
+  assert.ok(!list.text.includes(EMPTY_TEXT));
+
+  const rows = await readRows(page);
+  assert.equal(rows[0].cells[1], BAD_FIELD_TEXT);
+  assert.equal(rows[1].cells[1], BAD_FIELD_TEXT);
+  assert.deepEqual(rows[1].cells.slice(2, 6), ['五子棋', '2 人', '不限时', '未开始']);
+  assert.match(rows[1].cells[6], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+  // 第三行除编号外的展示字段全部异常：逐格替换，编号仍正常显示。
+  assert.equal(rows[2].cells[0], 'all-bad-2');
+  assert.deepEqual(rows[2].cells.slice(1), [
+    BAD_FIELD_TEXT, BAD_FIELD_TEXT, BAD_FIELD_TEXT, BAD_FIELD_TEXT,
+    BAD_FIELD_TEXT, BAD_FIELD_TEXT,
+  ]);
+  assert.equal(rows[2].timeTitle, null);
+});
+
+// 异常旧记录不能妨碍新房间显示：创建成功提示不能变成失败，列表刷新后
+// 旧异常记录原位保留、新房间照常追加，服务端原始记录不被删除、改写或展开。
+test('异常旧记录下创建房间：成功提示保留、新房间追加、旧记录与附带字段原位保留', { timeout: 60000 }, async (t) => {
+  const seed = [BAD_NAME, OK_BEFORE, 'null', '"误入的字符串"'];
+  const { page, baseURL } = await setupMixedPage(t, seed);
+
+  await waitForRowCount(page, 2);
+  await waitForSkipNotice(page);
+
+  const createdPromise = nextCreated(page);
+  await fillGomokuForm(page, '异常数据下新建的房间', 0);
+  await waitForMessageKind(page, 'ok');
+  const created = await createdPromise;
+  assert.ok(created.id, '异常旧记录不能把创建成功变成失败');
+
+  await waitForRowCount(page, 3);
+  const list = await readListArea(page);
+  assert.equal(list.rowCount, 3);
+  assert.equal(list.errorText, null);
+  assert.equal(
+    list.skipText,
+    '有 2 条房间记录无法作为房间显示，已跳过；原始数据仍保留在服务端，未被删除或改写。',
+    '创建房间不应改变非对象记录的跳过计数',
+  );
+
+  const rows = await readRows(page);
+  assert.deepEqual(
+    rows.map((r) => r.cells[0]),
+    ['bad-name', 'ok-before', created.id],
+    '异常旧记录原位保留，新房间追加为最后一行',
+  );
+  assert.equal(rows[0].cells[1], BAD_FIELD_TEXT, '旧异常记录刷新后仍是异常单元格');
+  assert.equal(rows[2].cells[1], created.name);
+  assert.equal(rows[2].cells[4], '不限时');
+  assert.equal(rows[2].badge, '未开始');
+
+  // 服务端原始记录一条不少、原位保留：异常名称仍是同一个对象，非对象记录
+  // 类型不变，新对象追加在最后；查看列表与创建都没有改写或展开旧记录。
+  const serverRooms = await readServerRooms(baseURL);
+  assert.equal(serverRooms.length, 5, '两条对象记录、两条非对象记录与新房间合计 5 条');
+  assert.deepEqual(serverRooms[0], JSON.parse(BAD_NAME), '异常名称对象必须原样保留');
+  assert.deepEqual(serverRooms[1], JSON.parse(OK_BEFORE));
+  assert.deepEqual(serverRooms.slice(2, 4), [null, '误入的字符串']);
+  assert.equal(serverRooms[4].id, created.id, '新房间应保存在最后');
+});
+
 test('混合记录下创建房间：原始记录原位保留，新房间追加为最后一行，跳过计数不变', { timeout: 60000 }, async (t) => {
   const seed = [R1, 'null', '"误入的字符串"', 'false', R2];
   const { page, baseURL } = await setupMixedPage(t, seed);
