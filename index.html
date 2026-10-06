@@ -23,6 +23,7 @@
   .msg.show { display: block; }
   .msg.error { background: #fde8e8; border: 1px solid #f5b5b5; color: #9b1c1c; }
   .msg.ok { background: #e6f6ec; border: 1px solid #a7e0bd; color: #146134; }
+  .msg.warn { background: #fff8e6; border: 1px solid #f0d48a; color: #7c4a03; }
   table { width: 100%; border-collapse: collapse; font-size: .95rem; }
   th, td { text-align: left; padding: .55rem .6rem; border-bottom: 1px solid #e4e7eb; vertical-align: top; }
   th { color: #52606d; font-size: .85rem; white-space: nowrap; }
@@ -248,12 +249,33 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (data) {
-        return { ok: resp.ok, status: resp.status, data: data };
+      // 记录正文是否完整读出并解析为 JSON。状态码已收到（如 201）但正文
+      // 为空、被截断或读取中断时，bodyOk 为 false：此时不能拿解析失败的
+      // 空数据冒充创建结果（否则会显示“编号：undefined”）。
+      return resp.json().then(function (data) {
+        return { ok: resp.ok, status: resp.status, data: data, bodyOk: true };
+      }, function () {
+        return { ok: resp.ok, status: resp.status, data: null, bodyOk: false };
       });
     }).then(function (result) {
       if (result.ok && result.status === 201) {
-        var okText = '房间已创建，编号：' + result.data.id;
+        // 只有正文完整读出、能解析且带有非空编号，才算拿到本次创建结果。
+        var createdId = result.bodyOk && result.data &&
+          typeof result.data.id === 'string' && result.data.id !== ''
+          ? result.data.id : null;
+
+        if (createdId === null) {
+          // 已收到 201 但创建结果未能确认：房间可能已经在服务端保存。
+          // 不承诺创建失败、不显示成功编号、不凭空拼房间或猜编号，
+          // 不自动重发本次提交，也不清空或改动房间列表；表单四项以页面
+          // 当前实际填写为准整体保留（含等待期间的修改，不整理名称首尾
+          // 空白、不补齐未填项），提醒用户先刷新页面核对列表再决定。
+          showMessage('warn', '创建结果未能确认：服务已返回成功状态，但回应内容未能完整读取，' +
+            '房间可能已经保存。请先刷新页面查看房间列表，确认是否已创建后，再决定是否重新提交。');
+          return;
+        }
+
+        var okText = '房间已创建，编号：' + createdId;
 
         // 是否复位以页面当前实际填写值为准，与提交时快照逐项比较：
         // 四项全部一致（含等待期间改过又完整恢复）才恢复初始表单；
