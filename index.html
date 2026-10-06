@@ -248,12 +248,49 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (data) {
-        return { ok: resp.ok, status: resp.status, data: data };
-      });
+      // 先把正文作为文本读完，再由页面自行解析：必须能区分“请求未送达/
+      // 响应未到达”与“状态行（201）已收到、但正文没读完整”这两种情况。
+      // 后者既不能当成成功（没有编号可展示），也不能说成失败（房间可能
+      // 已经在服务端保存），因此读取正文失败时只做标记，交由后面按状态
+      // 分支处理，不让它落到最外层的连接失败提示。
+      return resp.text().then(
+        function (text) {
+          return { ok: resp.ok, status: resp.status, text: text, readFailed: false };
+        },
+        function () {
+          return { ok: resp.ok, status: resp.status, text: '', readFailed: true };
+        }
+      );
     }).then(function (result) {
+      // 正文为空、读取中断或不是合法 JSON 时 data 为 null；合法 JSON 中
+      // 不是对象（null、数组、字符串、数字等）同样不能作为创建结果。
+      var data = null;
+      if (!result.readFailed && result.text !== '') {
+        try {
+          var parsed = JSON.parse(result.text);
+          if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            data = parsed;
+          }
+        } catch (e) {
+          data = null;
+        }
+      }
+
       if (result.ok && result.status === 201) {
-        var okText = '房间已创建，编号：' + result.data.id;
+        // 已收到 201 却拿不到完整合法、带编号的创建结果：创建是否落库
+        // 无法确认。明确提示用户房间可能已经保存、先刷新列表核对，再
+        // 决定是否重新提交；不承诺失败、不显示（更不能猜测）编号、不
+        // 复位表单、不自动刷新列表、不自动重发。表单四项保持此刻页面
+        // 上的实际填写（含等待期间的修改、首尾空白与未填完的项），
+        // 已有列表原样保留；按钮在 finally 中恢复可用。
+        if (!data || !data.id) {
+          showMessage('error', '创建结果未能确认：服务器已接受创建（HTTP 201），' +
+            '但响应内容没有读完整或无法解析，无法取得房间编号，房间可能已经保存。' +
+            '请先刷新页面查看房间列表，再决定是否需要重新提交。');
+          return;
+        }
+
+        var okText = '房间已创建，编号：' + data.id;
 
         // 是否复位以页面当前实际填写值为准，与提交时快照逐项比较：
         // 四项全部一致（含等待期间改过又完整恢复）才恢复初始表单；
@@ -279,8 +316,10 @@
         return loadRooms();
       }
       // 创建失败（被服务拒绝）：不触碰表单，等待期间的最新填写原样保留，
-      // 不回退到提交时的值，仅显示服务给出的原因。
-      var reason = result.data && result.data.error ? result.data.error
+      // 不回退到提交时的值，仅显示服务给出的原因。正文无法读取或解析、
+      // 或没有可读取的原因时，沿用现有的 HTTP 状态兜底文案（201 正文
+      // 不完整这一特殊情况已在上面单独处理，不会走到这里）。
+      var reason = data && data.error ? data.error
                  : ('创建失败（HTTP ' + result.status + '）');
       showMessage('error', reason);
     }).catch(function () {
