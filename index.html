@@ -86,9 +86,11 @@
 <script>
 (function () {
   var form = document.getElementById('room-form');
+  var nameInput = document.getElementById('name');
   var gameSel = document.getElementById('game');
   var capSel = document.getElementById('capacity');
   var capHint = document.getElementById('capacity-hint');
+  var turnInput = document.getElementById('turnSeconds');
   var submitBtn = document.getElementById('submit');
   var formMsg = document.getElementById('form-msg');
   var listArea = document.getElementById('list-area');
@@ -196,18 +198,27 @@
     event.preventDefault();
     clearMessage();
 
-    var result = checkForm({
-      name: document.getElementById('name').value,
+    // 快照四项“页面实际填写值”的原始内容（名称不去首尾空白、时间不做转换）。
+    // 请求返回后据此判断等待期间是否出现了下一间房的新输入；比较必须用
+    // 原始值：只调整名称首尾空白也算新输入，不能因保存时会去掉空白而被清掉。
+    var raw = {
+      name: nameInput.value,
       game: gameSel.value,
       capacity: capSel.value,
-      turnSeconds: document.getElementById('turnSeconds').value.trim()
+      turnSeconds: turnInput.value
+    };
+    var result = checkForm({
+      name: raw.name,
+      game: raw.game,
+      capacity: raw.capacity,
+      turnSeconds: raw.turnSeconds.trim()
     });
     if (result.error) { showMessage('error', result.error); return; }
 
-    submit(result.payload);
+    submit(result.payload, raw);
   });
 
-  function submit(payload) {
+  function submit(payload, submittedRaw) {
     submitBtn.disabled = true;
     fetch('/api/rooms', {
       method: 'POST',
@@ -219,12 +230,35 @@
       });
     }).then(function (result) {
       if (result.ok && result.status === 201) {
-        showMessage('ok', '房间已创建，编号：' + result.data.id);
-        form.reset();
-        syncCapacity();
+        // 提交后表单始终保持可编辑，本次房间只按点击时的 payload 创建；
+        // 等待响应期间继续填写既不改变已提交的配置，也不会自动再创建一间。
+        // 成功返回时逐字比较四项当前填写值与提交时快照：完全一致才恢复初始
+        // 表单；任一项不同（哪怕只动过首尾空白，或改过又恢复）就整体保留
+        // 当前四项内容及对应的人数选择状态，绝不只保留改过的单项，也不把
+        // 其他项恢复成旧配置。
+        var currentRaw = {
+          name: nameInput.value,
+          game: gameSel.value,
+          capacity: capSel.value,
+          turnSeconds: turnInput.value
+        };
+        var unchanged = currentRaw.name === submittedRaw.name &&
+          currentRaw.game === submittedRaw.game &&
+          currentRaw.capacity === submittedRaw.capacity &&
+          currentRaw.turnSeconds === submittedRaw.turnSeconds;
+        if (unchanged) {
+          showMessage('ok', '房间已创建，编号：' + result.data.id);
+          form.reset();
+          syncCapacity();
+        } else {
+          // 保留下来的只是尚未提交的填写内容（可能还没填完整），不能被当成
+          // 刚创建的房间；明确提示用户需要时可直接再次提交。
+          showMessage('ok', '房间已创建，编号：' + result.data.id +
+            '。表单中当前填写的内容尚未提交，需要再创建一间时可直接点击“创建房间”。');
+        }
         return loadRooms();
       }
-      // 创建失败：保留填写内容，仅显示原因。
+      // 创建失败：保留当时最新的填写内容（不回退到提交前的值），仅显示原因。
       var reason = result.data && result.data.error ? result.data.error
                  : ('创建失败（HTTP ' + result.status + '）');
       showMessage('error', reason);
