@@ -192,23 +192,57 @@
     };
   }
 
+  // 是否已有一次创建请求在途。等待期间表单四项仍可继续编辑（规则与人数
+  // 的联动照常生效），但不能再次提交：按钮在本次提交及随后的列表刷新
+  // 完成前保持禁用，这里再加一道防线，阻止通过回车键等方式触发第二次
+  // 提交。等待期间的编辑只影响表单本身：既不改变已提交的配置，也不会
+  // 自动再发出一次创建请求。
+  var submitting = false;
+
+  // 读取表单四项在页面上的实际填写值（名称保留首尾空白的原貌，不做整理）。
+  // 提交时与响应到达时各读一次并逐项比较，据此决定成功后是否复位表单。
+  function nameInput() { return document.getElementById('name'); }
+  function turnSecondsInput() { return document.getElementById('turnSeconds'); }
+  function readFormValues() {
+    return {
+      name: nameInput().value,
+      game: gameSel.value,
+      capacity: capSel.value,
+      turnSeconds: turnSecondsInput().value
+    };
+  }
+
   form.addEventListener('submit', function (event) {
     event.preventDefault();
+    if (submitting) return;
     clearMessage();
 
     var result = checkForm({
-      name: document.getElementById('name').value,
+      name: nameInput().value,
       game: gameSel.value,
       capacity: capSel.value,
-      turnSeconds: document.getElementById('turnSeconds').value.trim()
+      turnSeconds: turnSecondsInput().value.trim()
     });
     if (result.error) { showMessage('error', result.error); return; }
 
     submit(result.payload);
   });
 
+  // 表单复位到初始状态：名称与时间清空、规则未选、人数不可填写。
+  // 仅在创建成功且等待期间四项填写值与提交时完全一致时调用。
+  function resetForm() {
+    form.reset();
+    syncCapacity();
+  }
+
   function submit(payload) {
+    submitting = true;
     submitBtn.disabled = true;
+
+    // 点击提交瞬间四项的实际填写值快照。本次房间固定按 payload（即点击时
+    // 的配置）创建；响应到达时再读一次当前值与之逐项比较。
+    var submittedValues = readFormValues();
+
     fetch('/api/rooms', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -219,18 +253,41 @@
       });
     }).then(function (result) {
       if (result.ok && result.status === 201) {
-        showMessage('ok', '房间已创建，编号：' + result.data.id);
-        form.reset();
-        syncCapacity();
+        var okText = '房间已创建，编号：' + result.data.id;
+
+        // 是否复位以页面当前实际填写值为准，与提交时快照逐项比较：
+        // 四项全部一致（含等待期间改过又完整恢复）才恢复初始表单；
+        // 任一项不同——哪怕只动了名称的首尾空白——都整体保留当前四项
+        // 及其对应的人数选择状态，不能只留改过的项，也不能把其他项
+        // 恢复成旧配置；内容没填完整同样原样保留、不自动补齐。
+        var currentValues = readFormValues();
+        var unchanged = currentValues.name === submittedValues.name &&
+          currentValues.game === submittedValues.game &&
+          currentValues.capacity === submittedValues.capacity &&
+          currentValues.turnSeconds === submittedValues.turnSeconds;
+
+        if (unchanged) {
+          showMessage('ok', okText);
+          resetForm();
+        } else {
+          // 本次房间已按提交时的配置创建并生成编号；表单中是等待期间
+          // 继续填写、尚未提交的新配置，不会自动创建下一间房，完整保留
+          // 供用户处理完成后直接再次提交。
+          showMessage('ok', okText + '。表单中当前填写的内容尚未提交，不会自动创建房间；' +
+            '如需创建下一间，可直接点击“创建房间”。');
+        }
         return loadRooms();
       }
-      // 创建失败：保留填写内容，仅显示原因。
+      // 创建失败（被服务拒绝）：不触碰表单，等待期间的最新填写原样保留，
+      // 不回退到提交时的值，仅显示服务给出的原因。
       var reason = result.data && result.data.error ? result.data.error
                  : ('创建失败（HTTP ' + result.status + '）');
       showMessage('error', reason);
     }).catch(function () {
+      // 连接失败同样保留当时最新的填写内容。
       showMessage('error', '无法连接服务，请确认服务仍在运行后重试。');
     }).finally(function () {
+      submitting = false;
       submitBtn.disabled = false;
     });
   }
