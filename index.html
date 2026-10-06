@@ -97,6 +97,16 @@
   var GAME_LABELS = { gomoku: '五子棋', ludo: '飞行棋' };
   var STATUS_LABELS = { waiting: '未开始' };
 
+  // 只在标签表的自有属性中按字符串键精确匹配：不能直接 LABELS[value]，
+  // 否则历史值为 constructor、toString、__proto__ 等时会取到原型链上的
+  // 内置成员（函数或 Object.prototype），显示出函数源码或 [object Object]。
+  // 大小写不同（Gomoku、WAITING）或带空格的值自然匹配不上，按原文显示。
+  function ownLabel(table, value) {
+    return typeof value === 'string' &&
+      Object.prototype.hasOwnProperty.call(table, value)
+      ? table[value] : null;
+  }
+
   // 按所选规则重建人数上限选项。
   function syncCapacity() {
     var game = gameSel.value;
@@ -311,7 +321,8 @@
       key: 'game',
       label: '规则',
       render: function (td, value) {
-        td.textContent = GAME_LABELS[value] || value || '';
+        var label = ownLabel(GAME_LABELS, value);
+        td.textContent = label !== null ? label : (value || '');
       }
     },
     {
@@ -332,7 +343,8 @@
       key: 'status',
       label: '状态',
       render: function (td, value) {
-        appendBadge(td, STATUS_LABELS[value] || value || '');
+        var label = ownLabel(STATUS_LABELS, value);
+        appendBadge(td, label !== null ? label : (value || ''));
       },
       // 异常状态仍在原有徽标中显示提示文案。
       renderBad: function (td) { appendBadge(td, BAD_FIELD_TEXT); }
