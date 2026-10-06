@@ -94,8 +94,15 @@
   var listArea = document.getElementById('list-area');
   var emptyTip = document.getElementById('empty-tip');
 
-  var GAME_LABELS = { gomoku: '五子棋', ludo: '飞行棋' };
-  var STATUS_LABELS = { waiting: '未开始' };
+  // 映射表必须是无原型对象：历史值里可能恰好存着 "constructor"、"toString"、
+  // "__proto__" 这类字符串，普通对象字面量会沿原型链查到内置函数或
+  // Object.prototype，反而把函数源码或 [object Object] 当成中文映射显示。
+  // 无原型对象查这些键一律得到 undefined，于是按未知值逐字回显原文。
+  var GAME_LABELS = Object.create(null);
+  GAME_LABELS.gomoku = '五子棋';
+  GAME_LABELS.ludo = '飞行棋';
+  var STATUS_LABELS = Object.create(null);
+  STATUS_LABELS.waiting = '未开始';
 
   // 按所选规则重建人数上限选项。
   function syncCapacity() {
