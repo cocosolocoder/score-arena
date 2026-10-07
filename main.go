@@ -366,52 +366,57 @@ func parseRoomFields(w http.ResponseWriter, body []byte) (roomConfig, bool) {
 	}
 
 	var cfg roomConfig
-	missing := func(key string) (roomConfig, bool) {
-		respond(w, http.StatusBadRequest, map[string]string{"error": "缺少必填字段：" + key})
-		return roomConfig{}, false
+	for _, spec := range roomFieldSpecs {
+		raw, ok := fields[spec.key]
+		if !ok {
+			respond(w, http.StatusBadRequest, map[string]string{"error": "缺少必填字段：" + spec.key})
+			return roomConfig{}, false
+		}
+		if err := spec.decode(raw, &cfg); err != nil {
+			respond(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return roomConfig{}, false
+		}
 	}
-
-	rawName, ok := fields["name"]
-	if !ok {
-		return missing("name")
-	}
-	if err := json.Unmarshal(rawName, &cfg.Name); err != nil {
-		respond(w, http.StatusBadRequest, map[string]string{"error": "name 必须是字符串"})
-		return roomConfig{}, false
-	}
-
-	rawGame, ok := fields["game"]
-	if !ok {
-		return missing("game")
-	}
-	if err := json.Unmarshal(rawGame, &cfg.Game); err != nil {
-		respond(w, http.StatusBadRequest, map[string]string{"error": "game 必须是字符串"})
-		return roomConfig{}, false
-	}
-
-	rawCapacity, ok := fields["capacity"]
-	if !ok {
-		return missing("capacity")
-	}
-	capacity, err := parseStrictInt(rawCapacity)
-	if err != nil {
-		respond(w, http.StatusBadRequest, map[string]string{"error": "capacity 必须是整数：" + err.Error()})
-		return roomConfig{}, false
-	}
-	cfg.Capacity = capacity
-
-	rawTurn, ok := fields["turnSeconds"]
-	if !ok {
-		return missing("turnSeconds")
-	}
-	turn, err := parseStrictInt(rawTurn)
-	if err != nil {
-		respond(w, http.StatusBadRequest, map[string]string{"error": "turnSeconds 必须是整数：" + err.Error()})
-		return roomConfig{}, false
-	}
-	cfg.TurnSeconds = turn
-
 	return cfg, true
+}
+
+// roomFieldSpec 描述一个必填配置字段：键名以及把原始 JSON 值读入 roomConfig 的方式。
+// 同类型字段共用同一套读取与报错逻辑，便于一致维护。
+type roomFieldSpec struct {
+	key    string
+	decode func(raw json.RawMessage, cfg *roomConfig) error
+}
+
+// stringField 生成字符串字段的读取逻辑：值必须是 JSON 字符串，否则报 typeErr。
+func stringField(typeErr string, set func(cfg *roomConfig, v string)) func(json.RawMessage, *roomConfig) error {
+	return func(raw json.RawMessage, cfg *roomConfig) error {
+		var v string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return errors.New(typeErr)
+		}
+		set(cfg, v)
+		return nil
+	}
+}
+
+// intField 生成整数字段的读取逻辑：值必须是严格 JSON 整数，否则报 typeErr 加具体原因。
+func intField(typeErr string, set func(cfg *roomConfig, v int)) func(json.RawMessage, *roomConfig) error {
+	return func(raw json.RawMessage, cfg *roomConfig) error {
+		v, err := parseStrictInt(raw)
+		if err != nil {
+			return fmt.Errorf("%s%s", typeErr, err.Error())
+		}
+		set(cfg, v)
+		return nil
+	}
+}
+
+// roomFieldSpecs 按校验顺序列出全部必填字段；顺序即错误返回的优先次序。
+var roomFieldSpecs = []roomFieldSpec{
+	{"name", stringField("name 必须是字符串", func(cfg *roomConfig, v string) { cfg.Name = v })},
+	{"game", stringField("game 必须是字符串", func(cfg *roomConfig, v string) { cfg.Game = v })},
+	{"capacity", intField("capacity 必须是整数：", func(cfg *roomConfig, v int) { cfg.Capacity = v })},
+	{"turnSeconds", intField("turnSeconds 必须是整数：", func(cfg *roomConfig, v int) { cfg.TurnSeconds = v })},
 }
 
 // parseStrictInt 只接受单个 JSON 整数（拒绝小数、科学计数法、字符串、布尔、null、对象、数组及尾随内容）。
