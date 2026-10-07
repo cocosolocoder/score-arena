@@ -371,11 +371,14 @@ test('创建请求未送达服务的连接失败：保留填写内容，恢复�
     '成功提示中的编号应与服务端返回的新房间一致',
   );
 
-  // 表单恢复初始填写状态：名称和时间为空，规则未选择，人数不可填写。
-  assert.deepEqual(await readFormState(page), RESET_FORM, '成功后表单应恢复初始填写状态');
-
   // 列表刷新后在已有记录之后展示新房间，原有记录的内容和次序不变。
   await waitForRowCount(page, 3);
+
+  // 表单恢复初始填写状态：名称和时间为空，规则未选择，人数不可填写。按钮按
+  // 既有约定在创建成功及随后的列表刷新落定后才恢复可用，因此等到新行出现
+  // （列表刷新已渲染）后再核对整份复位状态，避免抢在刷新落定前读取。
+  assert.deepEqual(await readFormState(page), RESET_FORM, '成功后表单应恢复初始填写状态');
+
   const rows = await readRows(page);
   assert.deepEqual(rows.slice(0, 2), initialRows, '原有房间的内容或次序被改变');
   const added = rows[2];
