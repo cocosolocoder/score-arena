@@ -506,8 +506,15 @@
       })
       .then(function (data) {
         if (seq !== listQuerySeq) return;
-        var rooms = Array.isArray(data && data.rooms) ? data.rooms : [];
-        renderRooms(rooms);
+        // 读取成功的唯一形态：顶层是 JSON 对象且 rooms 字段是数组。
+        // 顶层为 null、数组或其他非对象值，缺少 rooms，或 rooms 为
+        // null、对象、字符串等非数组值时，都按加载失败处理——不能把
+        // 格式错误的响应当成空列表，也不能从其他字段里猜出房间。
+        if (data === null || typeof data !== 'object' || Array.isArray(data) ||
+            !Array.isArray(data.rooms)) {
+          throw new Error('rooms payload malformed');
+        }
+        renderRooms(data.rooms);
       })
       .catch(function () {
         if (seq !== listQuerySeq) return;
