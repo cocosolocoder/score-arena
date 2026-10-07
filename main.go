@@ -365,53 +365,59 @@ func parseRoomFields(w http.ResponseWriter, body []byte) (roomConfig, bool) {
 		return roomConfig{}, false
 	}
 
+	// 各字段按固定顺序依次读取：任一字段缺失或类型不符即返回 400，
+	// 不再继续后续字段，保证多项问题时的报错优先次序不变。
 	var cfg roomConfig
-	missing := func(key string) (roomConfig, bool) {
-		respond(w, http.StatusBadRequest, map[string]string{"error": "缺少必填字段：" + key})
-		return roomConfig{}, false
-	}
+	var errMsg string
+	var ok bool
 
-	rawName, ok := fields["name"]
-	if !ok {
-		return missing("name")
+	if cfg.Name, errMsg, ok = requiredString(fields, "name"); !ok {
+		return rejectField(w, errMsg)
 	}
-	if err := json.Unmarshal(rawName, &cfg.Name); err != nil {
-		respond(w, http.StatusBadRequest, map[string]string{"error": "name 必须是字符串"})
-		return roomConfig{}, false
+	if cfg.Game, errMsg, ok = requiredString(fields, "game"); !ok {
+		return rejectField(w, errMsg)
 	}
-
-	rawGame, ok := fields["game"]
-	if !ok {
-		return missing("game")
+	if cfg.Capacity, errMsg, ok = requiredInt(fields, "capacity"); !ok {
+		return rejectField(w, errMsg)
 	}
-	if err := json.Unmarshal(rawGame, &cfg.Game); err != nil {
-		respond(w, http.StatusBadRequest, map[string]string{"error": "game 必须是字符串"})
-		return roomConfig{}, false
+	if cfg.TurnSeconds, errMsg, ok = requiredInt(fields, "turnSeconds"); !ok {
+		return rejectField(w, errMsg)
 	}
-
-	rawCapacity, ok := fields["capacity"]
-	if !ok {
-		return missing("capacity")
-	}
-	capacity, err := parseStrictInt(rawCapacity)
-	if err != nil {
-		respond(w, http.StatusBadRequest, map[string]string{"error": "capacity 必须是整数：" + err.Error()})
-		return roomConfig{}, false
-	}
-	cfg.Capacity = capacity
-
-	rawTurn, ok := fields["turnSeconds"]
-	if !ok {
-		return missing("turnSeconds")
-	}
-	turn, err := parseStrictInt(rawTurn)
-	if err != nil {
-		respond(w, http.StatusBadRequest, map[string]string{"error": "turnSeconds 必须是整数：" + err.Error()})
-		return roomConfig{}, false
-	}
-	cfg.TurnSeconds = turn
-
 	return cfg, true
+}
+
+// rejectField 以 400 返回本次输入的具体问题。
+func rejectField(w http.ResponseWriter, errMsg string) (roomConfig, bool) {
+	respond(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+	return roomConfig{}, false
+}
+
+// requiredString 读取必填的字符串字段：缺失时报“缺少必填字段”，
+// 已提供但不是字符串时报“必须是字符串”，两者互不混淆。
+func requiredString(fields map[string]json.RawMessage, key string) (string, string, bool) {
+	raw, ok := fields[key]
+	if !ok {
+		return "", "缺少必填字段：" + key, false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", key + " 必须是字符串", false
+	}
+	return s, "", true
+}
+
+// requiredInt 读取必填的整数字段：缺失时报“缺少必填字段”，
+// 已提供但不是严格整数时报“必须是整数”及具体原因。
+func requiredInt(fields map[string]json.RawMessage, key string) (int, string, bool) {
+	raw, ok := fields[key]
+	if !ok {
+		return 0, "缺少必填字段：" + key, false
+	}
+	n, err := parseStrictInt(raw)
+	if err != nil {
+		return 0, key + " 必须是整数：" + err.Error(), false
+	}
+	return n, "", true
 }
 
 // parseStrictInt 只接受单个 JSON 整数（拒绝小数、科学计数法、字符串、布尔、null、对象、数组及尾随内容）。
